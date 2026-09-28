@@ -22,7 +22,7 @@ jobs:
           set -euo pipefail
           base64 -d bootstrap.b64 > /tmp/submux.tar.gz
           tar -xzf /tmp/submux.tar.gz -C .
-          rm -f bootstrap.b64 .github/workflows/bootstrap.yml
+          rm -f bootstrap.b64 .github/workflows/bootstrap.yml .github/workflows/docker.yml
       - name: Commit project
         shell: bash
         run: |
