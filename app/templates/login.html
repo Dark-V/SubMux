@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="ru" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SubMux — вход</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script>document.documentElement.dataset.theme=localStorage.getItem('submux-theme')||'auto';</script>
+</head>
+<body class="login-body">
+  <main class="login-card card">
+    <div class="brand"><span class="brand-mark">S</span><div><strong>SubMux</strong><small>Subscription multiplexer</small></div></div>
+    <h1>Панель управления</h1>
+    <p class="muted">Введите ADMIN_TOKEN контейнера.</p>
+    <div id="loginError" class="alert error hidden">Неверный ADMIN_TOKEN.</div>
+    <form method="post" action="/login">
+      <label>ADMIN_TOKEN<input name="admin_token" type="password" autocomplete="current-password" required autofocus></label>
+      <button class="primary wide" type="submit">Войти</button>
+    </form>
+    <button class="ghost wide" type="button" onclick="toggleTheme()">Сменить тему</button>
+  </main>
+<script>
+if (new URLSearchParams(location.search).has('error')) document.getElementById('loginError').classList.remove('hidden');
+function toggleTheme(){const c=localStorage.getItem('submux-theme')||'auto';const n=c==='dark'?'light':'dark';localStorage.setItem('submux-theme',n);document.documentElement.dataset.theme=n;}
+</script>
+</body>
+</html>

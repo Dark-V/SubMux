@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="ru" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SubMux</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script>document.documentElement.dataset.theme=localStorage.getItem('submux-theme')||'auto';</script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="brand-mark">S</span><div><strong>SubMux</strong><small>Subscription multiplexer</small></div></div>
+  <div class="toolbar">
+    <button class="ghost" id="themeBtn" type="button">Тема</button>
+    <form method="post" action="/logout"><button class="ghost" type="submit">Выйти</button></form>
+  </div>
+</header>
+<main class="container">
+  <div id="flash" class="alert hidden"></div>
+
+  <section class="hero">
+    <div><h1>Подписки</h1><p class="muted">Собирает несколько upstream-подписок в один endpoint и ограничивает доступ токенами.</p></div>
+    <div class="status"><span class="dot"></span> API :8080</div>
+  </section>
+
+  <section class="grid two">
+    <div class="card">
+      <div class="section-head"><div><h2 id="subFormTitle">Добавить подписку</h2><p class="muted">Минимум: URL, HWID и User-Agent.</p></div></div>
+      <form id="subForm" class="form-grid">
+        <input id="subId" type="hidden">
+        <label>Название<input id="subName" placeholder="superpupervpn" required maxlength="64"></label>
+        <label class="span-2">URL<input id="subUrl" type="url" placeholder="https://example.com/subscription" required></label>
+        <label>User-Agent<input id="subUa" value="v2raytun/android" required></label>
+        <label>HWID<input id="subHwid" placeholder="device-hwid"></label>
+        <details class="span-2 advanced">
+          <summary>Дополнительные заголовки</summary>
+          <div class="form-grid inner">
+            <label>Device OS<input id="subOs" value="Android"></label>
+            <label>OS version<input id="subVerOs" placeholder="Android 15"></label>
+            <label>Device model<input id="subModel" placeholder="Xiaomi ..."></label>
+            <label>App version<input id="subAppVersion" placeholder="5.23.74"></label>
+            <label>Формат<select id="subFormat"><option value="auto">Auto</option><option value="base64">Base64</option><option value="raw">Raw</option></select></label>
+            <label class="check"><input id="subEnabled" type="checkbox" checked> Включена</label>
+          </div>
+        </details>
+        <div class="actions span-2"><button class="primary" type="submit" id="subSave">Сохранить</button><button class="ghost hidden" type="button" id="subCancel">Отмена</button></div>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="section-head"><div><h2>Endpoint'ы</h2><p class="muted">Bearer-токен обязателен для каждого запроса.</p></div></div>
+      <div class="endpoint"><code>/TOKEN/subs</code><span>все разрешённые подписки</span></div>
+      <div class="endpoint"><code>/TOKEN/sub/superpupervpn</code><span>одна подписка</span></div>
+      <div class="endpoint"><code>/subs?token=TOKEN</code><span>query-вариант</span></div>
+      <div class="endpoint"><code>Authorization: Bearer TOKEN</code><span>без токена в URL</span></div>
+    </div>
+  </section>
+
+  <section class="card section-card">
+    <div class="section-head"><div><h2>Источники</h2><p class="muted" id="subCount">0 подписок</p></div></div>
+    <div id="subsList" class="list"></div>
+  </section>
+
+  <section class="grid two">
+    <div class="card">
+      <div class="section-head"><div><h2>Новый токен</h2><p class="muted">Токен хранится в БД и всегда доступен для копирования из панели.</p></div></div>
+      <form id="tokenForm" class="form-grid">
+        <label class="span-2">Название<input id="tokenLabel" value="access" maxlength="128" required></label>
+        <label class="check span-2"><input id="scopeAll" type="checkbox" checked> Доступ ко всем подпискам, включая добавленные позже</label>
+        <div id="scopeBox" class="span-2 hidden"><span class="label-title">Разрешить только:</span><div id="scopeSubs" class="checks"></div></div>
+        <div class="actions span-2"><button class="primary" type="submit">Создать токен</button></div>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="section-head"><div><h2>Токены доступа</h2><p class="muted" id="tokenCount">0 токенов</p></div></div>
+      <div id="tokensList" class="list compact"></div>
+    </div>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

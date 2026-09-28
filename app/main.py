@@ -1,0 +1,668 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import hmac
+import os
+import re
+import secrets
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import httpx
+import uvicorn
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, HttpUrl, field_validator
+
+APP_NAME = "SubMux"
+PORT = int(os.getenv("PORT", "8080"))
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
+DB_PATH = DATA_DIR / "submux.db"
+ADMIN_TOKEN_FILE = DATA_DIR / "admin_token"
+COOKIE_NAME = "submux_admin"
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "0").lower() in {"1", "true", "yes", "on"}
+BASE_DIR = Path(__file__).resolve().parent
+
+FORWARDED_HEADERS = (
+    "Content-Type",
+    "Content-Disposition",
+    "Subscription-Userinfo",
+    "Profile-Update-Interval",
+    "Profile-Title",
+)
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+@contextmanager
+def db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield con
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def init_db() -> None:
+    with db() as con:
+        con.executescript(
+            """
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                url TEXT NOT NULL,
+                user_agent TEXT NOT NULL,
+                hwid TEXT NOT NULL,
+                device_os TEXT NOT NULL DEFAULT 'Android',
+                ver_os TEXT NOT NULL DEFAULT '',
+                device_model TEXT NOT NULL DEFAULT '',
+                app_version TEXT NOT NULL DEFAULT '',
+                format TEXT NOT NULL DEFAULT 'auto',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                token TEXT NOT NULL UNIQUE,
+                scope_all INTEGER NOT NULL DEFAULT 1,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS token_subscriptions (
+                token_id INTEGER NOT NULL REFERENCES tokens(id) ON DELETE CASCADE,
+                subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+                PRIMARY KEY(token_id, subscription_id)
+            );
+            """
+        )
+
+
+def get_admin_token() -> str:
+    env_token = os.getenv("ADMIN_TOKEN", "").strip()
+    if env_token:
+        return env_token
+    if ADMIN_TOKEN_FILE.exists():
+        value = ADMIN_TOKEN_FILE.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    value = secrets.token_urlsafe(32)
+    ADMIN_TOKEN_FILE.write_text(value, encoding="utf-8")
+    try:
+        os.chmod(ADMIN_TOKEN_FILE, 0o600)
+    except OSError:
+        pass
+    print(f"[SubMux] ADMIN_TOKEN was not set. Generated persistent token: {value}", flush=True)
+    return value
+
+
+init_db()
+ADMIN_TOKEN = get_admin_token()
+ADMIN_COOKIE_VALUE = hashlib.sha256(f"submux:{ADMIN_TOKEN}".encode()).hexdigest()
+
+
+def legacy_import() -> None:
+    url = os.getenv("UPSTREAM_URL", "").strip()
+    if not url:
+        return
+    with db() as con:
+        count = con.execute("SELECT COUNT(*) AS c FROM subscriptions").fetchone()["c"]
+        if count:
+            return
+        name = slugify(os.getenv("INITIAL_SUB_NAME", "default"))
+        ts = now_iso()
+        con.execute(
+            """
+            INSERT INTO subscriptions
+            (name, url, user_agent, hwid, device_os, ver_os, device_model, app_version, format, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'auto', 1, ?, ?)
+            """,
+            (
+                name,
+                url,
+                os.getenv("USER_AGENT", "v2raytun/android"),
+                os.getenv("HWID", ""),
+                os.getenv("DEVICE_OS", "Android"),
+                os.getenv("VER_OS", ""),
+                os.getenv("DEVICE_MODEL", ""),
+                os.getenv("APP_VERSION", ""),
+                ts,
+                ts,
+            ),
+        )
+        print(f"[SubMux] Imported legacy UPSTREAM_URL as subscription '{name}'", flush=True)
+
+
+class SubscriptionIn(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    url: HttpUrl
+    user_agent: str = Field(default="v2raytun/android", min_length=1, max_length=512)
+    hwid: str = Field(default="", max_length=512)
+    device_os: str = Field(default="Android", max_length=128)
+    ver_os: str = Field(default="", max_length=128)
+    device_model: str = Field(default="", max_length=256)
+    app_version: str = Field(default="", max_length=128)
+    format: str = "auto"
+    enabled: bool = True
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        value = slugify(value)
+        if not value:
+            raise ValueError("name must contain letters, digits, _ or -")
+        return value
+
+    @field_validator("format")
+    @classmethod
+    def validate_format(cls, value: str) -> str:
+        if value not in {"auto", "base64", "raw"}:
+            raise ValueError("format must be auto, base64 or raw")
+        return value
+
+
+class TokenIn(BaseModel):
+    label: str = Field(default="access", min_length=1, max_length=128)
+    scope_all: bool = True
+    subscription_ids: list[int] = Field(default_factory=list)
+
+
+class TokenPatch(BaseModel):
+    label: str | None = Field(default=None, min_length=1, max_length=128)
+    enabled: bool | None = None
+    scope_all: bool | None = None
+    subscription_ids: list[int] | None = None
+
+
+def slugify(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", value.strip()).strip("-").lower()[:64]
+
+
+def row_dict(row: sqlite3.Row) -> dict[str, Any]:
+    d = dict(row)
+    if "enabled" in d:
+        d["enabled"] = bool(d["enabled"])
+    if "scope_all" in d:
+        d["scope_all"] = bool(d["scope_all"])
+    return d
+
+
+def admin_authenticated(request: Request) -> bool:
+    value = request.cookies.get(COOKIE_NAME, "")
+    return hmac.compare_digest(value, ADMIN_COOKIE_VALUE)
+
+
+def require_admin(request: Request) -> None:
+    if not admin_authenticated(request):
+        raise HTTPException(status_code=401, detail="Admin authentication required")
+
+
+def get_subscription_headers(sub: dict[str, Any]) -> dict[str, str]:
+    headers = {
+        "User-Agent": sub["user_agent"],
+        "X-HWID": sub["hwid"],
+        "X-Device-OS": sub["device_os"],
+        "X-Ver-OS": sub["ver_os"],
+        "X-Device-Model": sub["device_model"],
+        "X-App-Version": sub["app_version"],
+    }
+    return {k: v for k, v in headers.items() if v != ""}
+
+
+def get_token_record(token_value: str) -> dict[str, Any] | None:
+    with db() as con:
+        row = con.execute("SELECT * FROM tokens WHERE token = ? AND enabled = 1", (token_value,)).fetchone()
+        return row_dict(row) if row else None
+
+
+def extract_token(request: Request, path_token: str | None = None) -> str:
+    if path_token:
+        return path_token
+    query_token = request.query_params.get("token")
+    if query_token:
+        return query_token
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    raise HTTPException(status_code=401, detail="Missing access token")
+
+
+def allowed_subscriptions(token: dict[str, Any]) -> list[dict[str, Any]]:
+    with db() as con:
+        if token["scope_all"]:
+            rows = con.execute("SELECT * FROM subscriptions WHERE enabled = 1 ORDER BY id").fetchall()
+        else:
+            rows = con.execute(
+                """
+                SELECT s.* FROM subscriptions s
+                JOIN token_subscriptions ts ON ts.subscription_id = s.id
+                WHERE ts.token_id = ? AND s.enabled = 1
+                ORDER BY s.id
+                """,
+                (token["id"],),
+            ).fetchall()
+        return [row_dict(r) for r in rows]
+
+
+async def fetch_one(client: httpx.AsyncClient, sub: dict[str, Any]) -> dict[str, Any]:
+    try:
+        response = await client.get(sub["url"], headers=get_subscription_headers(sub))
+        return {
+            "sub": sub,
+            "ok": 200 <= response.status_code < 300,
+            "status": response.status_code,
+            "body": response.content,
+            "headers": dict(response.headers),
+            "error": None,
+        }
+    except Exception as exc:
+        return {"sub": sub, "ok": False, "status": 502, "body": b"", "headers": {}, "error": str(exc)}
+
+
+def response_headers_from_upstream(headers: dict[str, str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    lower = {k.lower(): v for k, v in headers.items()}
+    for name in FORWARDED_HEADERS:
+        if name.lower() in lower:
+            result[name] = lower[name.lower()]
+    result["Cache-Control"] = "no-store"
+    result["Pragma"] = "no-cache"
+    return result
+
+
+def maybe_decode_base64(body: bytes, forced: str) -> tuple[str, bool]:
+    text = body.decode("utf-8", errors="replace").strip()
+    if forced == "raw":
+        return text, False
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return "", forced == "base64"
+    try:
+        padded = compact + "=" * (-len(compact) % 4)
+        decoded = base64.b64decode(padded, validate=False).decode("utf-8")
+        meaningful = "://" in decoded or "\n" in decoded or "\r" in decoded
+        if forced == "base64" or meaningful:
+            return decoded.strip(), True
+    except Exception:
+        if forced == "base64":
+            raise ValueError("Upstream payload is not valid base64 text")
+    return text, False
+
+
+def parse_userinfo(value: str | None) -> dict[str, int]:
+    out: dict[str, int] = {}
+    if not value:
+        return out
+    for part in value.split(";"):
+        if "=" not in part:
+            continue
+        key, raw = part.strip().split("=", 1)
+        try:
+            out[key.lower()] = int(raw)
+        except ValueError:
+            continue
+    return out
+
+
+def merged_userinfo(results: list[dict[str, Any]]) -> str | None:
+    infos = [parse_userinfo(r["headers"].get("subscription-userinfo")) for r in results]
+    infos = [i for i in infos if i]
+    if not infos:
+        return None
+    upload = sum(i.get("upload", 0) for i in infos)
+    download = sum(i.get("download", 0) for i in infos)
+    totals = [i.get("total", 0) for i in infos]
+    total = 0 if any(v == 0 for v in totals) else sum(totals)
+    expires = [i.get("expire", 0) for i in infos if i.get("expire", 0) > 0]
+    expire = min(expires) if expires else 0
+    return f"upload={upload}; download={download}; total={total}; expire={expire}"
+
+
+def merge_payloads(results: list[dict[str, Any]]) -> tuple[bytes, dict[str, str]]:
+    items: list[str] = []
+    seen: set[str] = set()
+    all_base64 = True
+    for result in results:
+        content, was_base64 = maybe_decode_base64(result["body"], result["sub"]["format"])
+        all_base64 = all_base64 and was_base64
+        for line in content.replace("\r\n", "\n").split("\n"):
+            line = line.strip()
+            if line and line not in seen:
+                seen.add(line)
+                items.append(line)
+    merged_text = "\n".join(items)
+    if merged_text:
+        merged_text += "\n"
+    body = merged_text.encode("utf-8")
+    if all_base64:
+        body = base64.b64encode(body)
+
+    title = base64.b64encode(APP_NAME.encode()).decode()
+    headers = {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Disposition": "attachment; filename=submux.txt",
+        "Profile-Title": f"base64:{title}",
+        "Profile-Update-Interval": "3",
+        "Cache-Control": "no-store",
+        "Pragma": "no-cache",
+    }
+    userinfo = merged_userinfo(results)
+    if userinfo:
+        headers["Subscription-Userinfo"] = userinfo
+    return body, headers
+
+
+app = FastAPI(title=APP_NAME, docs_url=None, redoc_url=None)
+app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+legacy_import()
+
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok", "service": APP_NAME}
+
+
+@app.get("/")
+def root(request: Request):
+    return RedirectResponse("/admin" if admin_authenticated(request) else "/login", status_code=302)
+
+
+@app.get("/login")
+def login_page(request: Request):
+    if admin_authenticated(request):
+        return RedirectResponse("/admin", status_code=302)
+    return FileResponse(BASE_DIR / "templates" / "login.html")
+
+
+@app.post("/login")
+def login(admin_token: str = Form(...)):
+    if not hmac.compare_digest(admin_token, ADMIN_TOKEN):
+        return RedirectResponse("/login?error=1", status_code=303)
+    response = RedirectResponse("/admin", status_code=303)
+    response.set_cookie(
+        COOKIE_NAME,
+        ADMIN_COOKIE_VALUE,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="strict",
+        max_age=60 * 60 * 24 * 30,
+    )
+    return response
+
+
+@app.post("/logout")
+def logout():
+    response = RedirectResponse("/login", status_code=303)
+    response.delete_cookie(COOKIE_NAME)
+    return response
+
+
+@app.get("/admin")
+def admin_page(request: Request):
+    if not admin_authenticated(request):
+        return RedirectResponse("/login", status_code=302)
+    return FileResponse(BASE_DIR / "templates" / "index.html")
+
+
+@app.get("/api/subscriptions", dependencies=[Depends(require_admin)])
+def api_subscriptions():
+    with db() as con:
+        rows = con.execute("SELECT * FROM subscriptions ORDER BY id").fetchall()
+        return [row_dict(r) for r in rows]
+
+
+@app.post("/api/subscriptions", dependencies=[Depends(require_admin)])
+def api_add_subscription(item: SubscriptionIn):
+    ts = now_iso()
+    try:
+        with db() as con:
+            cur = con.execute(
+                """
+                INSERT INTO subscriptions
+                (name, url, user_agent, hwid, device_os, ver_os, device_model, app_version, format, enabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item.name,
+                    str(item.url),
+                    item.user_agent,
+                    item.hwid,
+                    item.device_os,
+                    item.ver_os,
+                    item.device_model,
+                    item.app_version,
+                    item.format,
+                    int(item.enabled),
+                    ts,
+                    ts,
+                ),
+            )
+            row = con.execute("SELECT * FROM subscriptions WHERE id = ?", (cur.lastrowid,)).fetchone()
+            return row_dict(row)
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Subscription name already exists")
+
+
+@app.put("/api/subscriptions/{sub_id}", dependencies=[Depends(require_admin)])
+def api_update_subscription(sub_id: int, item: SubscriptionIn):
+    ts = now_iso()
+    try:
+        with db() as con:
+            cur = con.execute(
+                """
+                UPDATE subscriptions SET
+                name=?, url=?, user_agent=?, hwid=?, device_os=?, ver_os=?, device_model=?, app_version=?, format=?, enabled=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    item.name,
+                    str(item.url),
+                    item.user_agent,
+                    item.hwid,
+                    item.device_os,
+                    item.ver_os,
+                    item.device_model,
+                    item.app_version,
+                    item.format,
+                    int(item.enabled),
+                    ts,
+                    sub_id,
+                ),
+            )
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Subscription not found")
+            row = con.execute("SELECT * FROM subscriptions WHERE id = ?", (sub_id,)).fetchone()
+            return row_dict(row)
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Subscription name already exists")
+
+
+@app.delete("/api/subscriptions/{sub_id}", dependencies=[Depends(require_admin)])
+def api_delete_subscription(sub_id: int):
+    with db() as con:
+        cur = con.execute("DELETE FROM subscriptions WHERE id = ?", (sub_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Subscription not found")
+    return {"ok": True}
+
+
+@app.post("/api/subscriptions/{sub_id}/test", dependencies=[Depends(require_admin)])
+async def api_test_subscription(sub_id: int):
+    with db() as con:
+        row = con.execute("SELECT * FROM subscriptions WHERE id = ?", (sub_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    sub = row_dict(row)
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+        result = await fetch_one(client, sub)
+    return {
+        "ok": result["ok"],
+        "status": result["status"],
+        "bytes": len(result["body"]),
+        "content_type": result["headers"].get("content-type"),
+        "profile_title": result["headers"].get("profile-title"),
+        "error": result["error"],
+    }
+
+
+@app.get("/api/tokens", dependencies=[Depends(require_admin)])
+def api_tokens():
+    with db() as con:
+        tokens = [row_dict(r) for r in con.execute("SELECT * FROM tokens ORDER BY id DESC").fetchall()]
+        for token in tokens:
+            rows = con.execute(
+                """
+                SELECT s.id, s.name FROM subscriptions s
+                JOIN token_subscriptions ts ON ts.subscription_id=s.id
+                WHERE ts.token_id=? ORDER BY s.id
+                """,
+                (token["id"],),
+            ).fetchall()
+            token["subscriptions"] = [dict(r) for r in rows]
+        return tokens
+
+
+@app.post("/api/tokens", dependencies=[Depends(require_admin)])
+def api_add_token(item: TokenIn):
+    token_value = secrets.token_urlsafe(32)
+    ts = now_iso()
+    with db() as con:
+        cur = con.execute(
+            "INSERT INTO tokens (label, token, scope_all, enabled, created_at) VALUES (?, ?, ?, 1, ?)",
+            (item.label.strip(), token_value, int(item.scope_all), ts),
+        )
+        token_id = int(cur.lastrowid)
+        if not item.scope_all:
+            if not item.subscription_ids:
+                raise HTTPException(status_code=400, detail="Select at least one subscription")
+            valid_ids = {r["id"] for r in con.execute("SELECT id FROM subscriptions").fetchall()}
+            if not set(item.subscription_ids).issubset(valid_ids):
+                raise HTTPException(status_code=400, detail="Unknown subscription id")
+            con.executemany(
+                "INSERT INTO token_subscriptions (token_id, subscription_id) VALUES (?, ?)",
+                [(token_id, sid) for sid in sorted(set(item.subscription_ids))],
+            )
+    return {"id": token_id, "label": item.label.strip(), "token": token_value, "scope_all": item.scope_all, "enabled": True}
+
+
+@app.patch("/api/tokens/{token_id}", dependencies=[Depends(require_admin)])
+def api_patch_token(token_id: int, item: TokenPatch):
+    with db() as con:
+        row = con.execute("SELECT * FROM tokens WHERE id = ?", (token_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Token not found")
+        current = row_dict(row)
+        label = item.label.strip() if item.label is not None else current["label"]
+        enabled = item.enabled if item.enabled is not None else current["enabled"]
+        scope_all = item.scope_all if item.scope_all is not None else current["scope_all"]
+        con.execute(
+            "UPDATE tokens SET label=?, enabled=?, scope_all=? WHERE id=?",
+            (label, int(enabled), int(scope_all), token_id),
+        )
+        if item.subscription_ids is not None or (item.scope_all is not None and item.scope_all):
+            con.execute("DELETE FROM token_subscriptions WHERE token_id=?", (token_id,))
+        if not scope_all and item.subscription_ids is not None:
+            valid_ids = {r["id"] for r in con.execute("SELECT id FROM subscriptions").fetchall()}
+            if not set(item.subscription_ids).issubset(valid_ids):
+                raise HTTPException(status_code=400, detail="Unknown subscription id")
+            con.executemany(
+                "INSERT INTO token_subscriptions (token_id, subscription_id) VALUES (?, ?)",
+                [(token_id, sid) for sid in sorted(set(item.subscription_ids))],
+            )
+    return {"ok": True}
+
+
+@app.delete("/api/tokens/{token_id}", dependencies=[Depends(require_admin)])
+def api_delete_token(token_id: int):
+    with db() as con:
+        cur = con.execute("DELETE FROM tokens WHERE id = ?", (token_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Token not found")
+    return {"ok": True}
+
+
+async def serve_public(request: Request, name: str | None = None, path_token: str | None = None) -> Response:
+    token_value = extract_token(request, path_token)
+    token = get_token_record(token_value)
+    if not token:
+        raise HTTPException(status_code=403, detail="Invalid or disabled access token")
+    subs = allowed_subscriptions(token)
+    if name is not None:
+        subs = [s for s in subs if s["name"] == name]
+        if not subs:
+            raise HTTPException(status_code=404, detail="Subscription not found or not allowed")
+    if not subs:
+        raise HTTPException(status_code=403, detail="Token has no accessible subscriptions")
+
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+        results = await asyncio.gather(*(fetch_one(client, sub) for sub in subs))
+
+    if name is not None or len(results) == 1:
+        result = results[0]
+        headers = response_headers_from_upstream(result["headers"])
+        if result["error"]:
+            return Response(content=f"Upstream connection error: {result['error']}", status_code=502, media_type="text/plain")
+        return Response(content=result["body"], status_code=result["status"], headers=headers)
+
+    good = [r for r in results if r["ok"]]
+    failed = [r for r in results if not r["ok"]]
+    if not good:
+        detail = "; ".join(f"{r['sub']['name']}: {r['error'] or r['status']}" for r in failed)
+        return Response(content=f"All upstream subscriptions failed: {detail}", status_code=502, media_type="text/plain")
+
+    try:
+        body, headers = merge_payloads(good)
+    except ValueError as exc:
+        return Response(content=f"Subscription merge error: {exc}", status_code=502, media_type="text/plain")
+    if failed:
+        headers["X-SubMux-Failed"] = ",".join(r["sub"]["name"] for r in failed)
+    return Response(content=body, status_code=200, headers=headers)
+
+
+@app.get("/subs")
+async def public_all(request: Request):
+    return await serve_public(request)
+
+
+@app.get("/sub/{name}")
+async def public_one(name: str, request: Request):
+    return await serve_public(request, name=slugify(name))
+
+
+@app.get("/{path_token}/subs")
+async def public_all_path(path_token: str, request: Request):
+    return await serve_public(request, path_token=path_token)
+
+
+@app.get("/{path_token}/sub/{name}")
+async def public_one_path(path_token: str, name: str, request: Request):
+    return await serve_public(request, name=slugify(name), path_token=path_token)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    if request.url.path.startswith("/api/"):
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+    return Response(str(exc.detail), status_code=exc.status_code, media_type="text/plain")
+
+
+if __name__ == "__main__":
+    uvicorn.run("app.main:app", host="0.0.0.0", port=PORT, proxy_headers=True)
