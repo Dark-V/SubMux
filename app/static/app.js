@@ -1,6 +1,7 @@
 const $ = s => document.querySelector(s);
 let subscriptions = [];
 let tokens = [];
+let appConfig = {};
 
 function flash(message, type='success') {
   const el = $('#flash'); el.textContent = message; el.className = `alert ${type}`;
@@ -20,7 +21,14 @@ function escapeHtml(v='') { return String(v).replace(/[&<>'"]/g,c=>({'&':'&amp;'
 function shortToken(v){ return v.length > 18 ? `${v.slice(0,10)}…${v.slice(-6)}` : v; }
 
 async function loadAll(){
-  [subscriptions, tokens] = await Promise.all([api('/api/subscriptions'), api('/api/tokens')]);
+  [subscriptions, tokens, appConfig] = await Promise.all([
+    api('/api/subscriptions'),
+    api('/api/tokens'),
+    api('/api/config')
+  ]);
+  const adminPort = location.port || (location.protocol === 'https:' ? '443' : '80');
+  const status = $('#listenerStatus');
+  if (status) status.innerHTML = '<span class="dot"></span> ADMIN :' + adminPort + ' · PUBLIC :' + appConfig.public_port;
   renderSubs(); renderScopes(); renderTokens(); syncScopeVisibility();
 }
 
@@ -55,10 +63,11 @@ function renderTokens(){
   box.innerHTML=tokens.map(t=>{
     const allowed=t.scope_all ? subscriptions.filter(s=>s.enabled) : (t.subscriptions||[]);
     const scope=t.scope_all?'все текущие и будущие источники':(allowed.map(s=>s.name).join(' + ')||'нет источников');
-    const shortUrl=`${location.origin}/${t.token}/`;
-    const subsUrl=`${location.origin}/${t.token}/subs`;
+    const publicBase=(appConfig.public_base_url||location.origin).replace(/\/$/,'');
+    const shortUrl=`${publicBase}/${t.token}/`;
+    const subsUrl=`${publicBase}/${t.token}/subs`;
     const namedButtons=allowed.map(s=>{
-      const u=`${location.origin}/${t.token}/sub/${encodeURIComponent(s.name)}`;
+      const u=`${publicBase}/${t.token}/sub/${encodeURIComponent(s.name)}`;
       return `<button class="ghost tiny" onclick="copyText('${escapeHtml(u)}')">${escapeHtml(s.name)}</button>`;
     }).join('');
     return `<div class="item token-card">
