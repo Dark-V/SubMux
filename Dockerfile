@@ -2,7 +2,8 @@ FROM python:3.13-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PORT=8080 \
+    ADMIN_PORT=8080 \
+    PUBLIC_PORT=8081 \
     DATA_DIR=/data
 
 WORKDIR /app
@@ -17,10 +18,10 @@ COPY --chown=submux:submux app ./app
 
 USER submux
 
-EXPOSE 8080
+EXPOSE 8080 8081
 VOLUME ["/data"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.getenv('PORT', '8080') + '/healthz', timeout=3)"
+  CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.getenv('ADMIN_PORT', '8080') + '/healthz', timeout=3)"
 
 CMD ["python", "-m", "app.main"]
