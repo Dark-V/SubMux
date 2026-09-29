@@ -39,7 +39,7 @@
             <label>OS version<input id="subVerOs" placeholder="Android 15"></label>
             <label>Device model<input id="subModel" placeholder="Xiaomi ..."></label>
             <label>App version<input id="subAppVersion" placeholder="5.23.74"></label>
-            <label>Формат<select id="subFormat"><option value="auto">Auto</option><option value="base64">Base64</option><option value="raw">Raw</option></select></label>
+            <label>Формат<select id="subFormat"><option value="auto">Auto URI-list</option><option value="base64">Base64 URI-list</option><option value="raw">Raw URI-list</option></select></label>
             <label class="check"><input id="subEnabled" type="checkbox" checked> Включена</label>
           </div>
         </details>
@@ -48,8 +48,9 @@
     </div>
 
     <div class="card">
-      <div class="section-head"><div><h2>Endpoint'ы</h2><p class="muted">Bearer-токен обязателен для каждого запроса.</p></div></div>
-      <div class="endpoint"><code>/TOKEN/subs</code><span>все разрешённые подписки</span></div>
+      <div class="section-head"><div><h2>Endpoint'ы</h2><p class="muted">Токен обязателен для каждого публичного запроса.</p></div></div>
+      <div class="endpoint"><code>/TOKEN/</code><span>короткий URL — все разрешённые подписки</span></div>
+      <div class="endpoint"><code>/TOKEN/subs</code><span>то же самое в явном виде</span></div>
       <div class="endpoint"><code>/TOKEN/sub/superpupervpn</code><span>одна подписка</span></div>
       <div class="endpoint"><code>/subs?token=TOKEN</code><span>query-вариант</span></div>
       <div class="endpoint"><code>Authorization: Bearer TOKEN</code><span>без токена в URL</span></div>
