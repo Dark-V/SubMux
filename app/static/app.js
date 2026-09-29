@@ -52,17 +52,26 @@ function renderTokens(){
   const box=$('#tokensList');
   if (!tokens.length){box.innerHTML='<div class="empty">Токенов пока нет.</div>';return;}
   box.innerHTML=tokens.map(t=>{
-    const scope=t.scope_all?'все подписки':(t.subscriptions?.map(s=>s.name).join(', ')||'нет доступа');
-    const path=`${location.origin}/${t.token}/subs`;
+    const allowed=t.scope_all ? subscriptions.filter(s=>s.enabled) : (t.subscriptions||[]);
+    const scope=t.scope_all?'все подписки':(allowed.map(s=>s.name).join(', ')||'нет доступа');
+    const shortUrl=`${location.origin}/${t.token}/`;
+    const subsUrl=`${location.origin}/${t.token}/subs`;
+    const namedButtons=allowed.map(s=>{
+      const u=`${location.origin}/${t.token}/sub/${encodeURIComponent(s.name)}`;
+      return `<button class="ghost tiny" onclick="copyText('${escapeHtml(u)}')">${escapeHtml(s.name)}</button>`;
+    }).join('');
     return `<div class="item">
       <div>
         <div class="item-title">${escapeHtml(t.label)} <span class="badge ${t.enabled?'ok':''}">${t.enabled?'active':'disabled'}</span></div>
         <div class="item-meta">Доступ: ${escapeHtml(scope)}</div>
-        <div class="token-value" title="${escapeHtml(t.token)}">${escapeHtml(shortToken(t.token))}</div>
+        <div class="token-value" title="Токен доступа">${escapeHtml(t.token)}</div>
+        <div class="item-meta token-url">${escapeHtml(shortUrl)}</div>
       </div>
       <div class="item-actions">
         <button class="ghost" onclick="copyText('${escapeHtml(t.token)}')">Токен</button>
-        <button class="ghost" onclick="copyText('${escapeHtml(path)}')">/subs URL</button>
+        <button class="ghost" onclick="copyText('${escapeHtml(shortUrl)}')">Короткий URL</button>
+        <button class="ghost" onclick="copyText('${escapeHtml(subsUrl)}')">/subs URL</button>
+        ${namedButtons}
         <button class="ghost" onclick="toggleToken(${t.id},${!t.enabled})">${t.enabled?'Выключить':'Включить'}</button>
         <button class="danger" onclick="deleteToken(${t.id})">Удалить</button>
       </div>
@@ -102,7 +111,7 @@ window.testSub=async id=>{try{const r=await api(`/api/subscriptions/${id}/test`,
 $('#scopeAll').addEventListener('change',()=>$('#scopeBox').classList.toggle('hidden',$('#scopeAll').checked));
 $('#tokenForm').addEventListener('submit',async e=>{
   e.preventDefault(); const all=$('#scopeAll').checked; const ids=[...document.querySelectorAll('#scopeSubs input:checked')].map(x=>Number(x.value));
-  try{const r=await api('/api/tokens',{method:'POST',body:JSON.stringify({label:$('#tokenLabel').value.trim(),scope_all:all,subscription_ids:ids})});await loadAll();flash(`Токен создан: ${r.token}`);}
+  try{const r=await api('/api/tokens',{method:'POST',body:JSON.stringify({label:$('#tokenLabel').value.trim(),scope_all:all,subscription_ids:ids})});$('#tokenForm').reset();$('#scopeAll').checked=true;$('#scopeBox').classList.add('hidden');await loadAll();flash(`Токен создан: ${r.token}`);}
   catch(err){flash(err.message,'error')}
 });
 window.toggleToken=async(id,enabled)=>{try{await api(`/api/tokens/${id}`,{method:'PATCH',body:JSON.stringify({enabled})});await loadAll();flash(enabled?'Токен включён.':'Токен выключен.')}catch(e){flash(e.message,'error')}};
