@@ -11,7 +11,7 @@ services:
       PORT: "8080"
       # Empty => SubMux generates a persistent token in /data/admin_token
       ADMIN_TOKEN: "${ADMIN_TOKEN:-}"
-      COOKIE_SECURE: "${COOKIE_SECURE:-0}"
+      COOKIE_SECURE: "${COOKIE_SECURE:-auto}"
     volumes:
       - submux-data:/data
     security_opt:
