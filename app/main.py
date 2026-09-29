@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import time
 from urllib.parse import parse_qsl, urlsplit
@@ -24,7 +25,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 APP_NAME = "SubMux"
-PORT = int(os.getenv("PORT", "8080"))
+ADMIN_PORT = int(os.getenv("ADMIN_PORT", os.getenv("PORT", "8080")))
+PUBLIC_PORT = int(os.getenv("PUBLIC_PORT", "8081"))
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "submux.db"
 ADMIN_TOKEN_FILE = DATA_DIR / "admin_token"
@@ -687,6 +690,60 @@ app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 legacy_import()
 
 
+def is_admin_listener_path(path: str) -> bool:
+    return (
+        path in {"/", "/admin", "/login", "/logout", "/healthz", "/favicon.ico"}
+        or path.startswith("/api/")
+        or path.startswith("/static/")
+    )
+
+
+def is_public_listener_path(path: str) -> bool:
+    if path == "/healthz":
+        return True
+    if path == "/subs":
+        return True
+    if path.startswith("/sub/") and len(path.split("/", 2)) == 3:
+        return True
+
+    parts = [part for part in path.split("/") if part]
+    if not parts:
+        return False
+
+    # Public token routes:
+    # /TOKEN/
+    # /TOKEN/subs
+    # /TOKEN/sub/NAME
+    if len(parts) == 1:
+        return parts[0] not in {
+            "admin", "login", "logout", "api", "static",
+            "favicon.ico", "openapi.json", "docs", "redoc", "healthz",
+        }
+    if len(parts) == 2 and parts[1] == "subs":
+        return True
+    if len(parts) == 3 and parts[1] == "sub" and parts[2]:
+        return True
+    return False
+
+
+@app.middleware("http")
+async def listener_isolation(request: Request, call_next):
+    server = request.scope.get("server")
+    local_port = int(server[1]) if server else ADMIN_PORT
+    path = request.url.path
+
+    if local_port == PUBLIC_PORT:
+        if not is_public_listener_path(path):
+            return Response("Not Found", status_code=404, media_type="text/plain")
+    elif local_port == ADMIN_PORT:
+        if not is_admin_listener_path(path):
+            return Response("Not Found", status_code=404, media_type="text/plain")
+    else:
+        return Response("Not Found", status_code=404, media_type="text/plain")
+
+    return await call_next(request)
+
+
 @app.get("/healthz")
 def healthz():
     return {"status": "ok", "service": APP_NAME}
@@ -738,6 +795,24 @@ def admin_page(request: Request):
     if not admin_authenticated(request):
         return RedirectResponse("/login", status_code=302)
     return FileResponse(BASE_DIR / "templates" / "index.html")
+
+
+@app.get("/api/config", dependencies=[Depends(require_admin)])
+def api_config(request: Request):
+    if PUBLIC_BASE_URL:
+        public_base = PUBLIC_BASE_URL
+    else:
+        host = request.url.hostname or "127.0.0.1"
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        public_base = f"{request.url.scheme}://{host}:{PUBLIC_PORT}"
+
+    return {
+        "admin_port": ADMIN_PORT,
+        "public_port": PUBLIC_PORT,
+        "public_base_url": public_base,
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
+    }
 
 
 @app.get("/api/subscriptions", dependencies=[Depends(require_admin)])
@@ -1202,5 +1277,24 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     return Response(str(exc.detail), status_code=exc.status_code, media_type="text/plain")
 
 
+def bind_listener(port: int) -> socket.socket:
+    sock = socket.socket(socket.AF_INET6 if ":" in "0.0.0.0" else socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", port))
+    sock.listen(2048)
+    sock.set_inheritable(True)
+    return sock
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT, proxy_headers=True)
+    if ADMIN_PORT == PUBLIC_PORT:
+        raise RuntimeError("ADMIN_PORT and PUBLIC_PORT must be different")
+
+    sockets = [bind_listener(ADMIN_PORT), bind_listener(PUBLIC_PORT)]
+    print(
+        f"[SubMux] admin listener: 0.0.0.0:{ADMIN_PORT}; "
+        f"public listener: 0.0.0.0:{PUBLIC_PORT}",
+        flush=True,
+    )
+    config = uvicorn.Config(app, proxy_headers=True, log_level="info")
+    uvicorn.Server(config).run(sockets=sockets)
