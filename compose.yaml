@@ -12,6 +12,8 @@ services:
       # Empty => SubMux generates a persistent token in /data/admin_token
       ADMIN_TOKEN: "${ADMIN_TOKEN:-}"
       COOKIE_SECURE: "${COOKIE_SECURE:-auto}"
+      # Persistent upstream/bundle cache TTL. Default: 30 minutes.
+      CACHE_TTL_SECONDS: "${CACHE_TTL_SECONDS:-1800}"
     volumes:
       - submux-data:/data
     security_opt:

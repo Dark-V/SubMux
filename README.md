@@ -10,6 +10,7 @@ Every public subscription request requires a token.
 
 ```text
 GET /<TOKEN>/
+GET /<TOKEN>/?forceUpdate=1
 GET /<TOKEN>/subs
 GET /<TOKEN>/sub/<name>
 GET /subs?token=<TOKEN>
@@ -17,7 +18,7 @@ GET /sub/<name>?token=<TOKEN>
 Authorization: Bearer <TOKEN>
 ```
 
-`/<TOKEN>/` and `/subs` return all subscriptions allowed by that token. `/sub/<name>` returns only the named upstream subscription.
+`/<TOKEN>/` and `/subs` return all subscriptions allowed by that token. `/sub/<name>` returns only the named upstream subscription. Add `?forceUpdate=1` to an aggregate or named URL to bypass the cache and refresh the required upstream source(s) immediately.
 
 Tokens can either:
 
@@ -72,6 +73,7 @@ services:
       - "8080:8080"
     environment:
       ADMIN_TOKEN: "replace-with-a-long-random-value"
+      CACHE_TTL_SECONDS: "1800"
     volumes:
       - submux-data:/data
 
@@ -103,11 +105,31 @@ They are imported into SQLite on first start. Do not commit real subscription UR
 
 For a named endpoint, SubMux returns that upstream body unchanged and forwards the useful subscription headers.
 
-For aggregate endpoints, upstreams are fetched concurrently. SubMux safely merges URI-list subscriptions (for example VLESS/VMess/Trojan/SS links) in either raw or base64 form: it decodes base64 lists, deduplicates complete URI lines and re-encodes the result when every source is base64.
+For aggregate endpoints, upstreams are fetched concurrently when the cache needs refresh. SubMux safely merges URI-list subscriptions (for example VLESS/VMess/Trojan/SS links) in either raw or base64 form. It decodes base64 lists, removes semantic duplicates, and re-encodes the result when every source is base64.
+
+Duplicate identity ignores URI credentials/userinfo (for example different VLESS UUIDs) and the display fragment after `#`, while preserving scheme, host/IP, port, path and transport/security query parameters. Therefore the same endpoint from two accounts collapses to the first entry in bundle order, but the same display name on different IPs remains two distinct profiles.
 
 Arbitrary YAML/JSON configs are intentionally **not** line-merged because that would corrupt them. They remain available through the named pass-through endpoint `/sub/<name>`. Use the per-source format setting only to disambiguate URI-list encoding.
 
 `Subscription-Userinfo` is combined where available. `upload` and `download` are summed, finite totals are summed, `total=0` remains unlimited, and the earliest non-zero expiry is used.
+
+## Cache behavior
+
+SubMux keeps both per-source and per-bundle caches persistently in `/data/submux.db`. The default TTL is 1800 seconds (30 minutes) and can be changed with `CACHE_TTL_SECONDS`.
+
+A normal request returns the cached bundle without contacting upstream while it is fresh. A background worker checks for expired bundles once per minute and refreshes them. Overlapping bundles reuse fresh per-source cache entries, so a source shared by several tokens is not fetched repeatedly during the same refresh window.
+
+`?forceUpdate=1` bypasses the TTL for that request, re-fetches every source required by the selected bundle, updates source cache, rebuilds the bundle and stores the new bundle cache.
+
+If a source refresh fails but a previous good source cache exists, SubMux uses that stale copy and marks the response with `X-SubMux-Stale`. If an entire refresh fails but a previous bundle for the same configuration exists, that bundle is served with `X-SubMux-Cache: STALE`.
+
+Useful response headers:
+
+```text
+X-SubMux-Cache: HIT | REFRESH | STALE | ERROR
+X-SubMux-Cache-Age: <seconds>
+X-SubMux-Stale: <source names, if any>
+```
 
 ## Security notes
 

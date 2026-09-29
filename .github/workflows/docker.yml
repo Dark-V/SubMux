@@ -70,7 +70,9 @@ jobs:
             -d '{"label":"all","scope_all":true,"subscription_ids":[]}' \
             http://127.0.0.1:18080/api/tokens | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
 
-          curl -fsS "http://127.0.0.1:18080/$TOKEN/" | base64 -d > /tmp/submux-merged.txt
+          curl -fsS -D /tmp/submux-h1 "http://127.0.0.1:18080/$TOKEN/" -o /tmp/submux-body1
+          grep -qi '^x-submux-cache: REFRESH' /tmp/submux-h1
+          base64 -d /tmp/submux-body1 > /tmp/submux-merged.txt
           grep -q 'user-one@one.example:443' /tmp/submux-merged.txt
           grep -q 'user-two@two.example:443' /tmp/submux-merged.txt
           test "$(grep -c 'dup.example:443' /tmp/submux-merged.txt)" -eq 1
@@ -79,6 +81,16 @@ jobs:
             echo "Semantic duplicate was not removed" >&2
             exit 1
           fi
+
+          # Second request must be served from persistent bundle cache.
+          curl -fsS -D /tmp/submux-h2 "http://127.0.0.1:18080/$TOKEN/" -o /tmp/submux-body2
+          grep -qi '^x-submux-cache: HIT' /tmp/submux-h2
+          cmp /tmp/submux-body1 /tmp/submux-body2
+
+          # forceUpdate must rebuild the selected bundle immediately.
+          curl -fsS -D /tmp/submux-h3 "http://127.0.0.1:18080/$TOKEN/?forceUpdate=1" -o /tmp/submux-body3
+          grep -qi '^x-submux-cache: REFRESH' /tmp/submux-h3
+          cmp /tmp/submux-body1 /tmp/submux-body3
 
           SCOPED=$(curl -fsS -b /tmp/submux-cookies -H 'Content-Type: application/json' \
             -d '{"label":"one-only","scope_all":false,"subscription_ids":[1]}' \
