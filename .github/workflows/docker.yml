@@ -39,38 +39,47 @@ jobs:
           docker volume create submux-smoke-data >/dev/null
           docker run -d --name submux-smoke \
             --add-host=host.docker.internal:host-gateway \
-            -p 18080:8080 \
+            -p 18081:8080 \
+            -p 18082:8081 \
             -e ADMIN_TOKEN=smoke-admin \
             -v submux-smoke-data:/data \
             submux:smoke >/dev/null
 
           for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:18080/healthz >/dev/null; then
+            if curl -fsS http://127.0.0.1:18081/healthz >/dev/null; then
               break
             fi
             sleep 1
           done
 
-          curl -fsS http://127.0.0.1:18080/healthz | grep -q '"status":"ok"'
-          curl -fsS http://127.0.0.1:18080/login | grep -q 'SubMux'
+          curl -fsS http://127.0.0.1:18081/healthz | grep -q '"status":"ok"'
+          curl -fsS http://127.0.0.1:18081/login | grep -q 'SubMux'
+
+          # Public listener must never expose the admin surface.
+          test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18082/admin)" = "404"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18082/login)" = "404"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18082/api/subscriptions)" = "404"
 
           curl -fsS -c /tmp/submux-cookies -o /dev/null \
             -X POST -d 'admin_token=smoke-admin' \
-            http://127.0.0.1:18080/login
+            http://127.0.0.1:18081/login
 
           curl -fsS -b /tmp/submux-cookies -H 'Content-Type: application/json' \
             -d '{"name":"one","url":"http://host.docker.internal:19090/one.txt","user_agent":"smoke","hwid":"hwid-one","format":"auto","enabled":true}' \
-            http://127.0.0.1:18080/api/subscriptions >/dev/null
+            http://127.0.0.1:18081/api/subscriptions >/dev/null
 
           curl -fsS -b /tmp/submux-cookies -H 'Content-Type: application/json' \
             -d '{"name":"two","url":"http://host.docker.internal:19090/two.txt","user_agent":"smoke","hwid":"hwid-two","format":"auto","enabled":true}' \
-            http://127.0.0.1:18080/api/subscriptions >/dev/null
+            http://127.0.0.1:18081/api/subscriptions >/dev/null
 
           TOKEN=$(curl -fsS -b /tmp/submux-cookies -H 'Content-Type: application/json' \
             -d '{"label":"all","scope_all":true,"subscription_ids":[]}' \
-            http://127.0.0.1:18080/api/tokens | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+            http://127.0.0.1:18081/api/tokens | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
 
-          curl -fsS -D /tmp/submux-h1 "http://127.0.0.1:18080/$TOKEN/" -o /tmp/submux-body1
+          # Admin listener must never serve public token routes.
+          test "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:18081/$TOKEN/")" = "404"
+
+          curl -fsS -D /tmp/submux-h1 "http://127.0.0.1:18082/$TOKEN/" -o /tmp/submux-body1
           grep -qi '^x-submux-cache: REFRESH' /tmp/submux-h1
           base64 -d /tmp/submux-body1 > /tmp/submux-merged.txt
           grep -q 'user-one@one.example:443' /tmp/submux-merged.txt
@@ -83,20 +92,20 @@ jobs:
           fi
 
           # Second request must be served from persistent bundle cache.
-          curl -fsS -D /tmp/submux-h2 "http://127.0.0.1:18080/$TOKEN/" -o /tmp/submux-body2
+          curl -fsS -D /tmp/submux-h2 "http://127.0.0.1:18082/$TOKEN/" -o /tmp/submux-body2
           grep -qi '^x-submux-cache: HIT' /tmp/submux-h2
           cmp /tmp/submux-body1 /tmp/submux-body2
 
           # forceUpdate must rebuild the selected bundle immediately.
-          curl -fsS -D /tmp/submux-h3 "http://127.0.0.1:18080/$TOKEN/?forceUpdate=1" -o /tmp/submux-body3
+          curl -fsS -D /tmp/submux-h3 "http://127.0.0.1:18082/$TOKEN/?forceUpdate=1" -o /tmp/submux-body3
           grep -qi '^x-submux-cache: REFRESH' /tmp/submux-h3
           cmp /tmp/submux-body1 /tmp/submux-body3
 
           SCOPED=$(curl -fsS -b /tmp/submux-cookies -H 'Content-Type: application/json' \
             -d '{"label":"one-only","scope_all":false,"subscription_ids":[1]}' \
-            http://127.0.0.1:18080/api/tokens | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+            http://127.0.0.1:18081/api/tokens | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
 
-          curl -fsS "http://127.0.0.1:18080/$SCOPED/" | base64 -d > /tmp/submux-scoped.txt
+          curl -fsS "http://127.0.0.1:18082/$SCOPED/" | base64 -d > /tmp/submux-scoped.txt
           grep -q 'user-one@one.example:443' /tmp/submux-scoped.txt
           grep -q 'user-a@dup.example:443' /tmp/submux-scoped.txt
           if grep -q 'user-two@two.example:443' /tmp/submux-scoped.txt; then
@@ -104,11 +113,11 @@ jobs:
             exit 1
           fi
 
-          curl -fsS "http://127.0.0.1:18080/sub/one?token=$SCOPED" | base64 -d | grep -q 'user-one@one.example:443'
+          curl -fsS "http://127.0.0.1:18082/sub/one?token=$SCOPED" | base64 -d | grep -q 'user-one@one.example:443'
 
           # Admin RAW inspector must return the upstream body byte-for-byte.
           curl -fsS -b /tmp/submux-cookies \
-            http://127.0.0.1:18080/api/subscriptions/1/raw > /tmp/submux-raw.txt
+            http://127.0.0.1:18081/api/subscriptions/1/raw > /tmp/submux-raw.txt
           cmp /tmp/submux-mock/one.txt /tmp/submux-raw.txt
 
       - uses: docker/setup-qemu-action@v3
