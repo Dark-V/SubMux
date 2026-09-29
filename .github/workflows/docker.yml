@@ -22,8 +22,8 @@ jobs:
           set -euo pipefail
 
           mkdir -p /tmp/submux-mock
-          printf 'vless://shared\nvless://one\n' | base64 -w0 > /tmp/submux-mock/one.txt
-          printf 'vless://shared\nvless://two\n' | base64 -w0 > /tmp/submux-mock/two.txt
+          printf 'vless://user-a@dup.example:443?security=reality&type=tcp&sni=example.com#A\nvless://user-one@one.example:443?security=reality&type=tcp#one\n' | base64 -w0 > /tmp/submux-mock/one.txt
+          printf 'vless://user-b@dup.example:443?type=tcp&sni=example.com&security=reality#B\nvless://user-two@two.example:443?security=reality&type=tcp#two\n' | base64 -w0 > /tmp/submux-mock/two.txt
           python3 -m http.server 19090 --bind 0.0.0.0 --directory /tmp/submux-mock >/tmp/submux-mock.log 2>&1 &
           MOCK_PID=$!
 
@@ -71,23 +71,28 @@ jobs:
             http://127.0.0.1:18080/api/tokens | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
 
           curl -fsS "http://127.0.0.1:18080/$TOKEN/" | base64 -d > /tmp/submux-merged.txt
-          grep -qx 'vless://one' /tmp/submux-merged.txt
-          grep -qx 'vless://two' /tmp/submux-merged.txt
-          test "$(grep -xc 'vless://shared' /tmp/submux-merged.txt)" -eq 1
+          grep -q 'user-one@one.example:443' /tmp/submux-merged.txt
+          grep -q 'user-two@two.example:443' /tmp/submux-merged.txt
+          test "$(grep -c 'dup.example:443' /tmp/submux-merged.txt)" -eq 1
+          grep -q 'user-a@dup.example:443' /tmp/submux-merged.txt
+          if grep -q 'user-b@dup.example:443' /tmp/submux-merged.txt; then
+            echo "Semantic duplicate was not removed" >&2
+            exit 1
+          fi
 
           SCOPED=$(curl -fsS -b /tmp/submux-cookies -H 'Content-Type: application/json' \
             -d '{"label":"one-only","scope_all":false,"subscription_ids":[1]}' \
             http://127.0.0.1:18080/api/tokens | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
 
           curl -fsS "http://127.0.0.1:18080/$SCOPED/" | base64 -d > /tmp/submux-scoped.txt
-          grep -qx 'vless://one' /tmp/submux-scoped.txt
-          grep -qx 'vless://shared' /tmp/submux-scoped.txt
-          if grep -q 'vless://two' /tmp/submux-scoped.txt; then
+          grep -q 'user-one@one.example:443' /tmp/submux-scoped.txt
+          grep -q 'user-a@dup.example:443' /tmp/submux-scoped.txt
+          if grep -q 'user-two@two.example:443' /tmp/submux-scoped.txt; then
             echo "Scoped token leaked subscription two" >&2
             exit 1
           fi
 
-          curl -fsS "http://127.0.0.1:18080/sub/one?token=$SCOPED" | base64 -d | grep -qx 'vless://one'
+          curl -fsS "http://127.0.0.1:18080/sub/one?token=$SCOPED" | base64 -d | grep -q 'user-one@one.example:443'
 
           # Admin RAW inspector must return the upstream body byte-for-byte.
           curl -fsS -b /tmp/submux-cookies \
