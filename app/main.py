@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import sqlite3
+from urllib.parse import parse_qsl, urlsplit
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -387,6 +388,35 @@ def merged_userinfo(results: list[dict[str, Any]]) -> str | None:
 
     return "; ".join(parts) if parts else None
 
+def proxy_identity_key(uri: str) -> str:
+    """Semantic identity for URI-style proxy entries.
+
+    Ignore userinfo credentials and the display fragment, while preserving
+    the actual destination and transport/security parameters. The first
+    matching entry in bundle order wins.
+    """
+    try:
+        parsed = urlsplit(uri)
+        if not parsed.scheme or parsed.hostname is None:
+            return uri
+
+        try:
+            port = parsed.port
+        except ValueError:
+            return uri
+
+        query = tuple(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
+        return repr((
+            parsed.scheme.lower(),
+            parsed.hostname.lower().rstrip("."),
+            port,
+            parsed.path or "",
+            query,
+        ))
+    except Exception:
+        return uri
+
+
 def merge_payloads(results: list[dict[str, Any]]) -> tuple[bytes, dict[str, str]]:
     items: list[str] = []
     seen: set[str] = set()
@@ -407,9 +437,13 @@ def merge_payloads(results: list[dict[str, Any]]) -> tuple[bytes, dict[str, str]
 
         for line in content.replace("\r\n", "\n").split("\n"):
             line = line.strip()
-            if line and line not in seen:
-                seen.add(line)
-                items.append(line)
+            if not line:
+                continue
+            key = proxy_identity_key(line)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(line)
 
     merged_text = "\n".join(items)
     if merged_text:
