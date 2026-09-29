@@ -22,8 +22,8 @@ jobs:
           set -euo pipefail
 
           mkdir -p /tmp/submux-mock
-          printf 'vless://one\n' | base64 -w0 > /tmp/submux-mock/one.txt
-          printf 'vless://two\n' | base64 -w0 > /tmp/submux-mock/two.txt
+          printf 'vless://shared\nvless://one\n' | base64 -w0 > /tmp/submux-mock/one.txt
+          printf 'vless://shared\nvless://two\n' | base64 -w0 > /tmp/submux-mock/two.txt
           python3 -m http.server 19090 --bind 0.0.0.0 --directory /tmp/submux-mock >/tmp/submux-mock.log 2>&1 &
           MOCK_PID=$!
 
@@ -73,6 +73,7 @@ jobs:
           curl -fsS "http://127.0.0.1:18080/$TOKEN/" | base64 -d > /tmp/submux-merged.txt
           grep -qx 'vless://one' /tmp/submux-merged.txt
           grep -qx 'vless://two' /tmp/submux-merged.txt
+          test "$(grep -xc 'vless://shared' /tmp/submux-merged.txt)" -eq 1
 
           SCOPED=$(curl -fsS -b /tmp/submux-cookies -H 'Content-Type: application/json' \
             -d '{"label":"one-only","scope_all":false,"subscription_ids":[1]}' \
@@ -80,6 +81,7 @@ jobs:
 
           curl -fsS "http://127.0.0.1:18080/$SCOPED/" | base64 -d > /tmp/submux-scoped.txt
           grep -qx 'vless://one' /tmp/submux-scoped.txt
+          grep -qx 'vless://shared' /tmp/submux-scoped.txt
           if grep -q 'vless://two' /tmp/submux-scoped.txt; then
             echo "Scoped token leaked subscription two" >&2
             exit 1

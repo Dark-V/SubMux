@@ -9,3 +9,5 @@
 @media(max-width:780px){.grid.two{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr}.form-grid .span-2{grid-column:span 1}.hero{flex-direction:column}.item{grid-template-columns:1fr}.item-actions{justify-content:flex-start}.checks{grid-template-columns:1fr}.container{padding:24px 14px}.topbar{padding:0 14px}}
 
 .tiny{padding:6px 9px;font-size:12px}.token-url{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;margin-top:6px}.token-value{user-select:all}
+
+.checks label{padding:7px 9px;border:1px solid var(--border);border-radius:8px;background:var(--panel);cursor:pointer}.checks label:has(input:checked){border-color:var(--accent)}

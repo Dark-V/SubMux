@@ -21,7 +21,7 @@ function shortToken(v){ return v.length > 18 ? `${v.slice(0,10)}…${v.slice(-6)
 
 async function loadAll(){
   [subscriptions, tokens] = await Promise.all([api('/api/subscriptions'), api('/api/tokens')]);
-  renderSubs(); renderScopes(); renderTokens();
+  renderSubs(); renderScopes(); renderTokens(); syncScopeVisibility();
 }
 
 function renderSubs(){
@@ -54,7 +54,7 @@ function renderTokens(){
   if (!tokens.length){box.innerHTML='<div class="empty">Токенов пока нет.</div>';return;}
   box.innerHTML=tokens.map(t=>{
     const allowed=t.scope_all ? subscriptions.filter(s=>s.enabled) : (t.subscriptions||[]);
-    const scope=t.scope_all?'все подписки':(allowed.map(s=>s.name).join(', ')||'нет доступа');
+    const scope=t.scope_all?'все текущие и будущие источники':(allowed.map(s=>s.name).join(' + ')||'нет источников');
     const shortUrl=`${location.origin}/${t.token}/`;
     const subsUrl=`${location.origin}/${t.token}/subs`;
     const namedButtons=allowed.map(s=>{
@@ -64,7 +64,7 @@ function renderTokens(){
     return `<div class="item">
       <div>
         <div class="item-title">${escapeHtml(t.label)} <span class="badge ${t.enabled?'ok':''}">${t.enabled?'active':'disabled'}</span></div>
-        <div class="item-meta">Доступ: ${escapeHtml(scope)}</div>
+        <div class="item-meta"><strong>Состав:</strong> ${escapeHtml(scope)}</div>
         <div class="token-value" title="Токен доступа">${escapeHtml(t.token)}</div>
         <div class="item-meta token-url">${escapeHtml(shortUrl)}</div>
       </div>
@@ -73,6 +73,7 @@ function renderTokens(){
         <button class="ghost" onclick="copyText('${escapeHtml(shortUrl)}')">Короткий URL</button>
         <button class="ghost" onclick="copyText('${escapeHtml(subsUrl)}')">/subs URL</button>
         ${namedButtons}
+        <button class="ghost" onclick="editToken(${t.id})">Состав</button>
         <button class="ghost" onclick="toggleToken(${t.id},${!t.enabled})">${t.enabled?'Выключить':'Включить'}</button>
         <button class="danger" onclick="deleteToken(${t.id})">Удалить</button>
       </div>
@@ -109,11 +110,53 @@ window.editSub=id=>{
 window.deleteSub=async id=>{if(!confirm('Удалить подписку?'))return;try{await api(`/api/subscriptions/${id}`,{method:'DELETE'});await loadAll();flash('Подписка удалена.')}catch(e){flash(e.message,'error')}};
 window.testSub=async id=>{try{const r=await api(`/api/subscriptions/${id}/test`,{method:'POST'});flash(r.ok?`Upstream OK: HTTP ${r.status}, ${r.bytes} bytes`:`Ошибка upstream: ${r.error||'HTTP '+r.status}`,r.ok?'success':'error')}catch(e){flash(e.message,'error')}};
 
-$('#scopeAll').addEventListener('change',()=>$('#scopeBox').classList.toggle('hidden',$('#scopeAll').checked));
+function syncScopeVisibility(){
+  $('#scopeBox').classList.toggle('hidden',$('#scopeAll').checked);
+}
+
+function resetTokenForm(){
+  $('#tokenForm').reset();
+  $('#tokenId').value='';
+  $('#tokenLabel').value='access';
+  $('#scopeAll').checked=false;
+  syncScopeVisibility();
+  document.querySelectorAll('#scopeSubs input').forEach(x=>x.checked=false);
+  $('#tokenFormTitle').textContent='Новая сборка';
+  $('#tokenSave').textContent='Создать сборку';
+  $('#tokenCancel').classList.add('hidden');
+}
+
+$('#scopeAll').addEventListener('change',syncScopeVisibility);
+$('#tokenCancel').addEventListener('click',resetTokenForm);
+
+window.editToken=id=>{
+  const t=tokens.find(x=>x.id===id); if(!t)return;
+  $('#tokenId').value=t.id;
+  $('#tokenLabel').value=t.label;
+  $('#scopeAll').checked=t.scope_all;
+  const selected=new Set((t.subscriptions||[]).map(s=>s.id));
+  document.querySelectorAll('#scopeSubs input').forEach(x=>x.checked=selected.has(Number(x.value)));
+  syncScopeVisibility();
+  $('#tokenFormTitle').textContent='Изменить сборку';
+  $('#tokenSave').textContent='Сохранить состав';
+  $('#tokenCancel').classList.remove('hidden');
+  $('#tokenForm').scrollIntoView({behavior:'smooth',block:'center'});
+};
+
 $('#tokenForm').addEventListener('submit',async e=>{
-  e.preventDefault(); const all=$('#scopeAll').checked; const ids=[...document.querySelectorAll('#scopeSubs input:checked')].map(x=>Number(x.value));
-  try{const r=await api('/api/tokens',{method:'POST',body:JSON.stringify({label:$('#tokenLabel').value.trim(),scope_all:all,subscription_ids:ids})});$('#tokenForm').reset();$('#scopeAll').checked=true;$('#scopeBox').classList.add('hidden');await loadAll();flash(`Токен создан: ${r.token}`);}
-  catch(err){flash(err.message,'error')}
+  e.preventDefault();
+  const id=$('#tokenId').value;
+  const all=$('#scopeAll').checked;
+  const ids=[...document.querySelectorAll('#scopeSubs input:checked')].map(x=>Number(x.value));
+  const payload={label:$('#tokenLabel').value.trim(),scope_all:all,subscription_ids:ids};
+  if(!all && ids.length===0){flash('Выбери хотя бы один источник.','error');return;}
+  try{
+    const r=await api(id?`/api/tokens/${id}`:'/api/tokens',{method:id?'PATCH':'POST',body:JSON.stringify(payload)});
+    const createdToken=!id?r.token:null;
+    resetTokenForm();
+    await loadAll();
+    flash(id?'Состав сборки обновлён.':`Сборка создана. Токен: ${createdToken}`);
+  } catch(err){flash(err.message,'error')}
 });
 window.toggleToken=async(id,enabled)=>{try{await api(`/api/tokens/${id}`,{method:'PATCH',body:JSON.stringify({enabled})});await loadAll();flash(enabled?'Токен включён.':'Токен выключен.')}catch(e){flash(e.message,'error')}};
 window.deleteToken=async id=>{if(!confirm('Удалить токен? Ссылки с ним сразу перестанут работать.'))return;try{await api(`/api/tokens/${id}`,{method:'DELETE'});await loadAll();flash('Токен удалён.')}catch(e){flash(e.message,'error')}};

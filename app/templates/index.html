@@ -64,17 +64,21 @@
 
   <section class="grid two">
     <div class="card">
-      <div class="section-head"><div><h2>Новый токен</h2><p class="muted">Токен хранится в БД и всегда доступен для копирования из панели.</p></div></div>
+      <div class="section-head"><div><h2 id="tokenFormTitle">Новая сборка</h2><p class="muted">Выбери upstream'ы — этот токен будет отдавать их объединённую подписку без дублей.</p></div></div>
       <form id="tokenForm" class="form-grid">
-        <label class="span-2">Название<input id="tokenLabel" value="access" maxlength="128" required></label>
-        <label class="check span-2"><input id="scopeAll" type="checkbox" checked> Доступ ко всем подпискам, включая добавленные позже</label>
-        <div id="scopeBox" class="span-2 hidden"><span class="label-title">Разрешить только:</span><div id="scopeSubs" class="checks"></div></div>
-        <div class="actions span-2"><button class="primary" type="submit">Создать токен</button></div>
+        <input id="tokenId" type="hidden">
+        <label class="span-2">Название сборки<input id="tokenLabel" value="access" maxlength="128" required placeholder="Syoga mobile"></label>
+        <label class="check span-2"><input id="scopeAll" type="checkbox"> Все текущие и будущие источники</label>
+        <div id="scopeBox" class="span-2"><span class="label-title">Состав сборки:</span><div id="scopeSubs" class="checks"></div></div>
+        <div class="actions span-2">
+          <button class="primary" type="submit" id="tokenSave">Создать сборку</button>
+          <button class="ghost hidden" type="button" id="tokenCancel">Отмена</button>
+        </div>
       </form>
     </div>
 
     <div class="card">
-      <div class="section-head"><div><h2>Токены доступа</h2><p class="muted" id="tokenCount">0 токенов</p></div></div>
+      <div class="section-head"><div><h2>Сборки / токены</h2><p class="muted" id="tokenCount">0 токенов</p></div></div>
       <div id="tokensList" class="list compact"></div>
     </div>
   </section>
