@@ -9,6 +9,7 @@ The web panel includes light/dark themes, subscription management, upstream test
 Every public subscription request requires a token.
 
 ```text
+GET /<TOKEN>/
 GET /<TOKEN>/subs
 GET /<TOKEN>/sub/<name>
 GET /subs?token=<TOKEN>
@@ -16,7 +17,7 @@ GET /sub/<name>?token=<TOKEN>
 Authorization: Bearer <TOKEN>
 ```
 
-`/subs` returns all subscriptions allowed by that token. `/sub/<name>` returns only the named upstream subscription.
+`/<TOKEN>/` and `/subs` return all subscriptions allowed by that token. `/sub/<name>` returns only the named upstream subscription.
 
 Tokens can either:
 
@@ -28,8 +29,9 @@ Tokens can either:
 ```bash
 git clone https://github.com/Dark-V/SubMux.git
 cd SubMux
-# edit ADMIN_TOKEN in compose.yaml first
-docker compose up -d --build
+# optional: cp .env.example .env and set ADMIN_TOKEN
+docker compose pull
+docker compose up -d
 ```
 
 Open `http://HOST:8080/`, sign in with `ADMIN_TOKEN`, then add a subscription.
@@ -46,6 +48,7 @@ HWID: YOUR_DEVICE_HWID
 The public URLs will look like:
 
 ```text
+http://HOST:8080/1fdsf3fhgds3d.../
 http://HOST:8080/1fdsf3fhgds3d.../subs
 http://HOST:8080/1fdsf3fhgds3d.../sub/superpupervpn
 ```
@@ -100,7 +103,9 @@ They are imported into SQLite on first start. Do not commit real subscription UR
 
 For a named endpoint, SubMux returns that upstream body unchanged and forwards the useful subscription headers.
 
-For `/subs`, upstreams are fetched concurrently. Base64 URI-list subscriptions are decoded, deduplicated by line, merged, and encoded back to base64. Raw text sources are concatenated as text. If formats are mixed, the aggregate output is raw text. Use `format=base64` or `format=raw` in the panel if auto-detection is not appropriate.
+For aggregate endpoints, upstreams are fetched concurrently. SubMux safely merges URI-list subscriptions (for example VLESS/VMess/Trojan/SS links) in either raw or base64 form: it decodes base64 lists, deduplicates complete URI lines and re-encodes the result when every source is base64.
+
+Arbitrary YAML/JSON configs are intentionally **not** line-merged because that would corrupt them. They remain available through the named pass-through endpoint `/sub/<name>`. Use the per-source format setting only to disambiguate URI-list encoding.
 
 `Subscription-Userinfo` is combined where available. `upload` and `download` are summed, finite totals are summed, `total=0` remains unlimited, and the earliest non-zero expiry is used.
 
@@ -116,6 +121,8 @@ The admin panel is protected separately by `ADMIN_TOKEN`. With HTTPS behind a re
 docker build -t submux:local .
 docker run --rm -p 8080:8080 -e ADMIN_TOKEN=test -v submux-data:/data submux:local
 ```
+
+Every push to `main` also runs a runtime smoke-test before the multi-architecture image is published. The smoke-test boots the container, checks the admin login/API, adds two mock upstreams, verifies aggregate output, verifies a subscription-scoped token, and only then pushes the image.
 
 ## License
 

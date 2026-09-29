@@ -1,18 +1,21 @@
 services:
   submux:
-    build: .
     image: ghcr.io/dark-v/submux:latest
+    pull_policy: always
     container_name: submux
     restart: unless-stopped
+    init: true
     ports:
       - "8080:8080"
     environment:
       PORT: "8080"
-      # Strongly recommended: replace this before first start.
-      ADMIN_TOKEN: "change-me-now"
-      # COOKIE_SECURE: "1" # enable when the panel is served over HTTPS
+      # Empty => SubMux generates a persistent token in /data/admin_token
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-}"
+      COOKIE_SECURE: "${COOKIE_SECURE:-0}"
     volumes:
       - submux-data:/data
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   submux-data:
