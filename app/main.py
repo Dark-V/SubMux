@@ -4,10 +4,12 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import json
 import os
 import re
 import secrets
 import sqlite3
+import time
 from urllib.parse import parse_qsl, urlsplit
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -28,7 +30,12 @@ DB_PATH = DATA_DIR / "submux.db"
 ADMIN_TOKEN_FILE = DATA_DIR / "admin_token"
 COOKIE_NAME = "submux_admin"
 COOKIE_SECURE_MODE = os.getenv("COOKIE_SECURE", "auto").strip().lower()
+CACHE_TTL_SECONDS = max(60, int(os.getenv("CACHE_TTL_SECONDS", "1800")))
 BASE_DIR = Path(__file__).resolve().parent
+
+_SOURCE_LOCKS: dict[int, asyncio.Lock] = {}
+_BUNDLE_LOCKS: dict[int, asyncio.Lock] = {}
+_CACHE_REFRESH_TASK: asyncio.Task | None = None
 
 FORWARDED_HEADERS = (
     "Content-Type",
@@ -92,6 +99,22 @@ def init_db() -> None:
                 token_id INTEGER NOT NULL REFERENCES tokens(id) ON DELETE CASCADE,
                 subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
                 PRIMARY KEY(token_id, subscription_id)
+            );
+            CREATE TABLE IF NOT EXISTS subscription_cache (
+                subscription_id INTEGER PRIMARY KEY REFERENCES subscriptions(id) ON DELETE CASCADE,
+                config_hash TEXT NOT NULL,
+                fetched_at INTEGER NOT NULL,
+                status INTEGER NOT NULL,
+                body BLOB NOT NULL,
+                headers_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS bundle_cache (
+                token_id INTEGER PRIMARY KEY REFERENCES tokens(id) ON DELETE CASCADE,
+                fingerprint TEXT NOT NULL,
+                generated_at INTEGER NOT NULL,
+                status INTEGER NOT NULL,
+                body BLOB NOT NULL,
+                headers_json TEXT NOT NULL
             );
             """
         )
@@ -293,6 +316,197 @@ async def fetch_one(client: httpx.AsyncClient, sub: dict[str, Any]) -> dict[str,
         }
     except Exception as exc:
         return {"sub": sub, "ok": False, "status": 502, "body": b"", "headers": {}, "error": str(exc)}
+
+
+def subscription_config_hash(sub: dict[str, Any]) -> str:
+    payload = {
+        "url": sub["url"],
+        "user_agent": sub["user_agent"],
+        "hwid": sub["hwid"],
+        "device_os": sub["device_os"],
+        "ver_os": sub["ver_os"],
+        "device_model": sub["device_model"],
+        "app_version": sub["app_version"],
+        "format": sub["format"],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def bundle_fingerprint(token: dict[str, Any], subs: list[dict[str, Any]]) -> str:
+    payload = {
+        "token_id": token["id"],
+        "scope_all": bool(token["scope_all"]),
+        "subscriptions": [
+            {
+                "id": sub["id"],
+                "updated_at": sub["updated_at"],
+                "config_hash": subscription_config_hash(sub),
+            }
+            for sub in subs
+        ],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def cache_age(timestamp: int) -> int:
+    return max(0, int(time.time()) - int(timestamp))
+
+
+def get_cached_source(sub: dict[str, Any], allow_stale: bool = False) -> dict[str, Any] | None:
+    config_hash = subscription_config_hash(sub)
+    with db() as con:
+        row = con.execute(
+            "SELECT * FROM subscription_cache WHERE subscription_id=? AND config_hash=?",
+            (sub["id"], config_hash),
+        ).fetchone()
+    if not row:
+        return None
+    age = cache_age(row["fetched_at"])
+    if not allow_stale and age >= CACHE_TTL_SECONDS:
+        return None
+    return {
+        "sub": sub,
+        "ok": True,
+        "status": int(row["status"]),
+        "body": bytes(row["body"]),
+        "headers": json.loads(row["headers_json"]),
+        "error": None,
+        "cached": True,
+        "stale": age >= CACHE_TTL_SECONDS,
+        "cache_age": age,
+    }
+
+
+def store_cached_source(result: dict[str, Any]) -> None:
+    if not result.get("ok"):
+        return
+    sub = result["sub"]
+    with db() as con:
+        con.execute(
+            """
+            INSERT INTO subscription_cache
+                (subscription_id, config_hash, fetched_at, status, body, headers_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(subscription_id) DO UPDATE SET
+                config_hash=excluded.config_hash,
+                fetched_at=excluded.fetched_at,
+                status=excluded.status,
+                body=excluded.body,
+                headers_json=excluded.headers_json
+            """,
+            (
+                sub["id"],
+                subscription_config_hash(sub),
+                int(time.time()),
+                int(result["status"]),
+                sqlite3.Binary(result["body"]),
+                json.dumps(result["headers"], ensure_ascii=False),
+            ),
+        )
+
+
+async def get_or_refresh_source(
+    client: httpx.AsyncClient,
+    sub: dict[str, Any],
+    force: bool = False,
+) -> dict[str, Any]:
+    if not force:
+        cached = get_cached_source(sub)
+        if cached:
+            return cached
+
+    lock = _SOURCE_LOCKS.setdefault(sub["id"], asyncio.Lock())
+    async with lock:
+        if not force:
+            cached = get_cached_source(sub)
+            if cached:
+                return cached
+
+        previous = get_cached_source(sub, allow_stale=True)
+        result = await fetch_one(client, sub)
+        if result["ok"]:
+            result["cached"] = False
+            result["stale"] = False
+            result["cache_age"] = 0
+            store_cached_source(result)
+            return result
+
+        # Keep the last known-good source if refresh fails.
+        if previous:
+            previous["stale"] = True
+            previous["refresh_error"] = result["error"] or f"HTTP {result['status']}"
+            return previous
+        return result
+
+
+def get_cached_bundle(
+    token: dict[str, Any],
+    fingerprint: str,
+    allow_stale: bool = False,
+) -> dict[str, Any] | None:
+    with db() as con:
+        row = con.execute(
+            "SELECT * FROM bundle_cache WHERE token_id=? AND fingerprint=?",
+            (token["id"], fingerprint),
+        ).fetchone()
+    if not row:
+        return None
+    age = cache_age(row["generated_at"])
+    if not allow_stale and age >= CACHE_TTL_SECONDS:
+        return None
+    return {
+        "status": int(row["status"]),
+        "body": bytes(row["body"]),
+        "headers": json.loads(row["headers_json"]),
+        "generated_at": int(row["generated_at"]),
+        "cache_age": age,
+        "stale": age >= CACHE_TTL_SECONDS,
+    }
+
+
+def store_cached_bundle(
+    token: dict[str, Any],
+    fingerprint: str,
+    body: bytes,
+    headers: dict[str, str],
+    status: int = 200,
+) -> None:
+    with db() as con:
+        con.execute(
+            """
+            INSERT INTO bundle_cache
+                (token_id, fingerprint, generated_at, status, body, headers_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(token_id) DO UPDATE SET
+                fingerprint=excluded.fingerprint,
+                generated_at=excluded.generated_at,
+                status=excluded.status,
+                body=excluded.body,
+                headers_json=excluded.headers_json
+            """,
+            (
+                token["id"],
+                fingerprint,
+                int(time.time()),
+                status,
+                sqlite3.Binary(body),
+                json.dumps(headers, ensure_ascii=False),
+            ),
+        )
+
+
+def cache_headers(headers: dict[str, str], state: str, age: int = 0) -> dict[str, str]:
+    out = dict(headers)
+    out["X-SubMux-Cache"] = state
+    out["X-SubMux-Cache-Age"] = str(max(0, age))
+    return out
+
+
+def force_update_requested(request: Request) -> bool:
+    raw = request.query_params.get("forceUpdate", request.query_params.get("forceupdate", ""))
+    return raw.strip().lower() in {"1", "true", "yes", "on", "force"}
 
 
 def response_headers_from_upstream(headers: dict[str, str]) -> dict[str, str]:
