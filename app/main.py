@@ -954,42 +954,210 @@ def api_delete_token(token_id: int):
     return {"ok": True}
 
 
-async def serve_public(request: Request, name: str | None = None, path_token: str | None = None) -> Response:
-    token_value = extract_token(request, path_token)
-    token = get_token_record(token_value)
-    if not token:
-        raise HTTPException(status_code=403, detail="Invalid or disabled access token")
-    subs = allowed_subscriptions(token)
-    if name is not None:
-        subs = [s for s in subs if s["name"] == name]
-        if not subs:
-            raise HTTPException(status_code=404, detail="Subscription not found or not allowed")
-    if not subs:
-        raise HTTPException(status_code=403, detail="Token has no accessible subscriptions")
-
+async def build_public_payload(
+    token: dict[str, Any],
+    subs: list[dict[str, Any]],
+    force_sources: bool = False,
+) -> tuple[int, bytes, dict[str, str]]:
     async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
-        results = await asyncio.gather(*(fetch_one(client, sub) for sub in subs))
+        results = await asyncio.gather(
+            *(get_or_refresh_source(client, sub, force=force_sources) for sub in subs)
+        )
 
-    if name is not None or len(results) == 1:
+    stale = [r for r in results if r.get("stale")]
+    if len(results) == 1:
         result = results[0]
         headers = response_headers_from_upstream(result["headers"])
+        if result.get("stale"):
+            headers["X-SubMux-Stale"] = result["sub"]["name"]
         if result["error"]:
-            return Response(content=f"Upstream connection error: {result['error']}", status_code=502, media_type="text/plain")
-        return Response(content=result["body"], status_code=result["status"], headers=headers)
+            body = f"Upstream connection error: {result['error']}".encode()
+            return 502, body, {"Content-Type": "text/plain; charset=utf-8"}
+        return int(result["status"]), result["body"], headers
 
     good = [r for r in results if r["ok"]]
     failed = [r for r in results if not r["ok"]]
     if not good:
         detail = "; ".join(f"{r['sub']['name']}: {r['error'] or r['status']}" for r in failed)
-        return Response(content=f"All upstream subscriptions failed: {detail}", status_code=502, media_type="text/plain")
+        return 502, f"All upstream subscriptions failed: {detail}".encode(), {
+            "Content-Type": "text/plain; charset=utf-8"
+        }
 
     try:
         body, headers = merge_payloads(good)
     except ValueError as exc:
-        return Response(content=f"Subscription merge error: {exc}", status_code=502, media_type="text/plain")
+        return 502, f"Subscription merge error: {exc}".encode(), {
+            "Content-Type": "text/plain; charset=utf-8"
+        }
+
     if failed:
         headers["X-SubMux-Failed"] = ",".join(r["sub"]["name"] for r in failed)
-    return Response(content=body, status_code=200, headers=headers)
+    if stale:
+        headers["X-SubMux-Stale"] = ",".join(r["sub"]["name"] for r in stale)
+    return 200, body, headers
+
+
+async def refresh_bundle_cache(
+    token: dict[str, Any],
+    subs: list[dict[str, Any]],
+    force_sources: bool = False,
+) -> tuple[int, bytes, dict[str, str], str, int]:
+    fingerprint = bundle_fingerprint(token, subs)
+    lock = _BUNDLE_LOCKS.setdefault(token["id"], asyncio.Lock())
+
+    async with lock:
+        # Another request may have refreshed the bundle while we waited.
+        if not force_sources:
+            cached = get_cached_bundle(token, fingerprint)
+            if cached:
+                return (
+                    cached["status"],
+                    cached["body"],
+                    cached["headers"],
+                    "HIT",
+                    cached["cache_age"],
+                )
+
+        stale_bundle = get_cached_bundle(token, fingerprint, allow_stale=True)
+        status, body, headers = await build_public_payload(
+            token, subs, force_sources=force_sources
+        )
+
+        if 200 <= status < 300:
+            store_cached_bundle(token, fingerprint, body, headers, status)
+            return status, body, headers, "REFRESH", 0
+
+        # Upstreams are temporarily unavailable: keep serving the last
+        # known-good bundle for the same current configuration.
+        if stale_bundle:
+            headers = dict(stale_bundle["headers"])
+            headers["X-SubMux-Stale-Bundle"] = "1"
+            return (
+                stale_bundle["status"],
+                stale_bundle["body"],
+                headers,
+                "STALE",
+                stale_bundle["cache_age"],
+            )
+
+        return status, body, headers, "ERROR", 0
+
+
+async def refresh_all_bundle_caches() -> None:
+    with db() as con:
+        rows = con.execute("SELECT * FROM tokens WHERE enabled=1 ORDER BY id").fetchall()
+        tokens_to_refresh = [row_dict(row) for row in rows]
+
+    for token in tokens_to_refresh:
+        subs = allowed_subscriptions(token)
+        if not subs:
+            continue
+        try:
+            # Bypass the final bundle cache, but allow fresh source-cache
+            # entries to be reused. Overlapping bundles therefore do not
+            # hammer the same upstream repeatedly in one refresh cycle.
+            fingerprint = bundle_fingerprint(token, subs)
+            lock = _BUNDLE_LOCKS.setdefault(token["id"], asyncio.Lock())
+            async with lock:
+                status, body, headers = await build_public_payload(
+                    token, subs, force_sources=False
+                )
+                if 200 <= status < 300:
+                    store_cached_bundle(token, fingerprint, body, headers, status)
+        except Exception as exc:
+            print(
+                f"[SubMux] background cache refresh failed for token {token['id']}: {exc}",
+                flush=True,
+            )
+
+
+async def cache_refresh_loop() -> None:
+    while True:
+        await asyncio.sleep(CACHE_TTL_SECONDS)
+        await refresh_all_bundle_caches()
+
+
+@app.on_event("startup")
+async def start_cache_refresh_task():
+    global _CACHE_REFRESH_TASK
+    if _CACHE_REFRESH_TASK is None or _CACHE_REFRESH_TASK.done():
+        _CACHE_REFRESH_TASK = asyncio.create_task(cache_refresh_loop())
+
+
+@app.on_event("shutdown")
+async def stop_cache_refresh_task():
+    global _CACHE_REFRESH_TASK
+    if _CACHE_REFRESH_TASK is not None:
+        _CACHE_REFRESH_TASK.cancel()
+        try:
+            await _CACHE_REFRESH_TASK
+        except asyncio.CancelledError:
+            pass
+        _CACHE_REFRESH_TASK = None
+
+
+async def serve_public(request: Request, name: str | None = None, path_token: str | None = None) -> Response:
+    token_value = extract_token(request, path_token)
+    token = get_token_record(token_value)
+    if not token:
+        raise HTTPException(status_code=403, detail="Invalid or disabled access token")
+
+    subs = allowed_subscriptions(token)
+    if name is not None:
+        subs = [sub for sub in subs if sub["name"] == name]
+        if not subs:
+            raise HTTPException(status_code=404, detail="Subscription not found or not allowed")
+    if not subs:
+        raise HTTPException(status_code=403, detail="Token has no accessible subscriptions")
+
+    force = force_update_requested(request)
+
+    # Named pass-through endpoints use the persistent per-source cache too.
+    if name is not None:
+        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+            before = None if force else get_cached_source(subs[0])
+            result = await get_or_refresh_source(client, subs[0], force=force)
+
+        if result["error"]:
+            return Response(
+                content=f"Upstream connection error: {result['error']}",
+                status_code=502,
+                media_type="text/plain",
+            )
+
+        headers = response_headers_from_upstream(result["headers"])
+        state = "REFRESH" if force or before is None else "HIT"
+        age = int(result.get("cache_age", 0))
+        if result.get("stale"):
+            state = "STALE"
+            headers["X-SubMux-Stale"] = result["sub"]["name"]
+        return Response(
+            content=result["body"],
+            status_code=result["status"],
+            headers=cache_headers(headers, state, age),
+        )
+
+    fingerprint = bundle_fingerprint(token, subs)
+
+    if not force:
+        cached = get_cached_bundle(token, fingerprint)
+        if cached:
+            return Response(
+                content=cached["body"],
+                status_code=cached["status"],
+                headers=cache_headers(
+                    cached["headers"], "HIT", cached["cache_age"]
+                ),
+            )
+
+    status, body, headers, state, age = await refresh_bundle_cache(
+        token, subs, force_sources=force
+    )
+    return Response(
+        content=body,
+        status_code=status,
+        headers=cache_headers(headers, state, age),
+    )
 
 
 @app.get("/subs")
