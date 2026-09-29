@@ -193,7 +193,9 @@ class TokenPatch(BaseModel):
 
 
 def slugify(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_-]+", "-", value.strip()).strip("-").lower()[:64]
+    # Keep Unicode letters/digits (including Cyrillic), plus "_" and "-".
+    # FastAPI/clients will percent-encode non-ASCII names in URLs as needed.
+    return re.sub(r"[^\w-]+", "-", value.strip(), flags=re.UNICODE).strip("-").lower()[:64]
 
 
 def row_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -288,24 +290,45 @@ def response_headers_from_upstream(headers: dict[str, str]) -> dict[str, str]:
     return result
 
 
+URI_LINE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+def looks_like_uri_list(text: str) -> bool:
+    lines = [line.strip() for line in text.replace("\r\n", "\n").split("\n") if line.strip()]
+    if not lines:
+        return False
+    uri_lines = [line for line in lines if URI_LINE_RE.match(line)]
+    # Subscription URI lists may contain a few comments, but the actual
+    # payload should overwhelmingly be proxy URIs.
+    return bool(uri_lines) and len(uri_lines) / len(lines) >= 0.8
+
+
 def maybe_decode_base64(body: bytes, forced: str) -> tuple[str, bool]:
     text = body.decode("utf-8", errors="replace").strip()
     if forced == "raw":
         return text, False
+
     compact = re.sub(r"\s+", "", text)
     if not compact:
         return "", forced == "base64"
+
     try:
         padded = compact + "=" * (-len(compact) % 4)
-        decoded = base64.b64decode(padded, validate=False).decode("utf-8")
-        meaningful = "://" in decoded or "\n" in decoded or "\r" in decoded
-        if forced == "base64" or meaningful:
-            return decoded.strip(), True
+        decoded = base64.b64decode(padded, validate=True).decode("utf-8").strip()
     except Exception:
         if forced == "base64":
-            raise ValueError("Upstream payload is not valid base64 text")
-    return text, False
+            raise ValueError("Upstream payload is not valid base64 UTF-8 text")
+        return text, False
 
+    if forced == "base64":
+        return decoded, True
+
+    # Auto-detection is intentionally conservative. Do not accidentally
+    # reinterpret YAML/JSON/plain text merely because it happens to decode.
+    if looks_like_uri_list(decoded):
+        return decoded, True
+
+    return text, False
 
 def parse_userinfo(value: str | None) -> dict[str, int]:
     out: dict[str, int] = {}
@@ -327,32 +350,58 @@ def merged_userinfo(results: list[dict[str, Any]]) -> str | None:
     infos = [i for i in infos if i]
     if not infos:
         return None
-    upload = sum(i.get("upload", 0) for i in infos)
-    download = sum(i.get("download", 0) for i in infos)
-    totals = [i.get("total", 0) for i in infos]
-    total = 0 if any(v == 0 for v in totals) else sum(totals)
-    expires = [i.get("expire", 0) for i in infos if i.get("expire", 0) > 0]
-    expire = min(expires) if expires else 0
-    return f"upload={upload}; download={download}; total={total}; expire={expire}"
 
+    parts: list[str] = []
+
+    if any("upload" in i for i in infos):
+        parts.append(f"upload={sum(i.get('upload', 0) for i in infos)}")
+    if any("download" in i for i in infos):
+        parts.append(f"download={sum(i.get('download', 0) for i in infos)}")
+
+    # Missing "total" must not be treated as "unlimited" (total=0).
+    if all("total" in i for i in infos):
+        totals = [i["total"] for i in infos]
+        total = 0 if any(v == 0 for v in totals) else sum(totals)
+        parts.append(f"total={total}")
+
+    expires = [i["expire"] for i in infos if i.get("expire", 0) > 0]
+    if expires:
+        parts.append(f"expire={min(expires)}")
+    elif all("expire" in i for i in infos):
+        parts.append("expire=0")
+
+    return "; ".join(parts) if parts else None
 
 def merge_payloads(results: list[dict[str, Any]]) -> tuple[bytes, dict[str, str]]:
     items: list[str] = []
     seen: set[str] = set()
     all_base64 = True
+
     for result in results:
         content, was_base64 = maybe_decode_base64(result["body"], result["sub"]["format"])
         all_base64 = all_base64 and was_base64
+
+        # SubMux can safely merge URI-list subscriptions. Arbitrary YAML/JSON
+        # configs need format-specific parsers; concatenating/deduplicating
+        # their lines would silently corrupt them.
+        if content and not looks_like_uri_list(content):
+            raise ValueError(
+                f"{result['sub']['name']}: aggregate mode supports URI-list "
+                "subscriptions (raw or base64); use /sub/<name> for pass-through configs"
+            )
+
         for line in content.replace("\r\n", "\n").split("\n"):
             line = line.strip()
             if line and line not in seen:
                 seen.add(line)
                 items.append(line)
+
     merged_text = "\n".join(items)
     if merged_text:
         merged_text += "\n"
+
     body = merged_text.encode("utf-8")
-    if all_base64:
+    if all_base64 and results:
         body = base64.b64encode(body)
 
     title = base64.b64encode(APP_NAME.encode()).decode()
@@ -361,6 +410,7 @@ def merge_payloads(results: list[dict[str, Any]]) -> tuple[bytes, dict[str, str]
         "Content-Disposition": "attachment; filename=submux.txt",
         "Profile-Title": f"base64:{title}",
         "Profile-Update-Interval": "3",
+        "X-SubMux-Sources": ",".join(r["sub"]["name"] for r in results),
         "Cache-Control": "no-store",
         "Pragma": "no-cache",
     }
@@ -368,7 +418,6 @@ def merge_payloads(results: list[dict[str, Any]]) -> tuple[bytes, dict[str, str]
     if userinfo:
         headers["Subscription-Userinfo"] = userinfo
     return body, headers
-
 
 app = FastAPI(title=APP_NAME, docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -652,6 +701,13 @@ async def public_all_path(path_token: str, request: Request):
     return await serve_public(request, path_token=path_token)
 
 
+@app.get("/{path_token}")
+@app.get("/{path_token}/")
+async def public_all_short_path(path_token: str, request: Request):
+    """Short token URL: /<TOKEN>/ returns the aggregate subscription."""
+    return await serve_public(request, path_token=path_token)
+
+
 @app.get("/{path_token}/sub/{name}")
 async def public_one_path(path_token: str, name: str, request: Request):
     return await serve_public(request, name=slugify(name), path_token=path_token)
@@ -665,4 +721,4 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 
 if __name__ == "__main__":
-    uvicorn.run("app.main:app", host="0.0.0.0", port=PORT, proxy_headers=True)
+    uvicorn.run(app, host="0.0.0.0", port=PORT, proxy_headers=True)
