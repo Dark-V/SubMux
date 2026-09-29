@@ -26,7 +26,7 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "submux.db"
 ADMIN_TOKEN_FILE = DATA_DIR / "admin_token"
 COOKIE_NAME = "submux_admin"
-COOKIE_SECURE = os.getenv("COOKIE_SECURE", "0").lower() in {"1", "true", "yes", "on"}
+COOKIE_SECURE_MODE = os.getenv("COOKIE_SECURE", "auto").strip().lower()
 BASE_DIR = Path(__file__).resolve().parent
 
 FORWARDED_HEADERS = (
@@ -210,6 +210,21 @@ def row_dict(row: sqlite3.Row) -> dict[str, Any]:
 def admin_authenticated(request: Request) -> bool:
     value = request.cookies.get(COOKIE_NAME, "")
     return hmac.compare_digest(value, ADMIN_COOKIE_VALUE)
+
+
+def cookie_secure_for(request: Request) -> bool:
+    if COOKIE_SECURE_MODE in {"1", "true", "yes", "on"}:
+        return True
+    if COOKIE_SECURE_MODE in {"0", "false", "no", "off"}:
+        return False
+
+    # Auto mode: honor the reverse proxy scheme first, otherwise use
+    # FastAPI's request scheme. This lets direct HTTP logins work while
+    # keeping the cookie Secure when the public endpoint is HTTPS.
+    forwarded_proto = request.headers.get("x-forwarded-proto", "")
+    if forwarded_proto:
+        return forwarded_proto.split(",", 1)[0].strip().lower() == "https"
+    return request.url.scheme.lower() == "https"
 
 
 def require_admin(request: Request) -> None:
@@ -429,6 +444,11 @@ def healthz():
     return {"status": "ok", "service": APP_NAME}
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204)
+
+
 @app.get("/")
 def root(request: Request):
     return RedirectResponse("/admin" if admin_authenticated(request) else "/login", status_code=302)
@@ -442,7 +462,7 @@ def login_page(request: Request):
 
 
 @app.post("/login")
-def login(admin_token: str = Form(...)):
+def login(request: Request, admin_token: str = Form(...)):
     if not hmac.compare_digest(admin_token, ADMIN_TOKEN):
         return RedirectResponse("/login?error=1", status_code=303)
     response = RedirectResponse("/admin", status_code=303)
@@ -450,17 +470,18 @@ def login(admin_token: str = Form(...)):
         COOKIE_NAME,
         ADMIN_COOKIE_VALUE,
         httponly=True,
-        secure=COOKIE_SECURE,
-        samesite="strict",
+        secure=cookie_secure_for(request),
+        samesite="lax",
+        path="/",
         max_age=60 * 60 * 24 * 30,
     )
     return response
 
 
 @app.post("/logout")
-def logout():
+def logout(request: Request):
     response = RedirectResponse("/login", status_code=303)
-    response.delete_cookie(COOKIE_NAME)
+    response.delete_cookie(COOKIE_NAME, path="/", secure=cookie_secure_for(request), samesite="lax")
     return response
 
 
