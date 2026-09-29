@@ -1053,12 +1053,19 @@ async def refresh_all_bundle_caches() -> None:
         if not subs:
             continue
         try:
-            # Bypass the final bundle cache, but allow fresh source-cache
-            # entries to be reused. Overlapping bundles therefore do not
-            # hammer the same upstream repeatedly in one refresh cycle.
             fingerprint = bundle_fingerprint(token, subs)
+            # Do not move the bundle timestamp forward unless it is actually
+            # due for refresh. The worker polls frequently so the effective
+            # refresh period stays close to CACHE_TTL_SECONDS.
+            if get_cached_bundle(token, fingerprint):
+                continue
+
             lock = _BUNDLE_LOCKS.setdefault(token["id"], asyncio.Lock())
             async with lock:
+                if get_cached_bundle(token, fingerprint):
+                    continue
+                # Fresh source-cache entries may be reused across overlapping
+                # bundles; stale ones are fetched from upstream.
                 status, body, headers = await build_public_payload(
                     token, subs, force_sources=False
                 )
@@ -1072,8 +1079,9 @@ async def refresh_all_bundle_caches() -> None:
 
 
 async def cache_refresh_loop() -> None:
+    poll_seconds = min(60, CACHE_TTL_SECONDS)
     while True:
-        await asyncio.sleep(CACHE_TTL_SECONDS)
+        await asyncio.sleep(poll_seconds)
         await refresh_all_bundle_caches()
 
 
