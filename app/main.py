@@ -574,6 +574,43 @@ def api_delete_subscription(sub_id: int):
     return {"ok": True}
 
 
+@app.get("/api/subscriptions/{sub_id}/raw", dependencies=[Depends(require_admin)])
+async def api_raw_subscription(sub_id: int):
+    """Return the upstream payload byte-for-byte, forced to text/plain for inspection."""
+    with db() as con:
+        row = con.execute("SELECT * FROM subscriptions WHERE id = ?", (sub_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    sub = row_dict(row)
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+        result = await fetch_one(client, sub)
+
+    if result["error"]:
+        return Response(
+            content=f"Upstream connection error: {result['error']}",
+            status_code=502,
+            headers={
+                "Content-Type": "text/plain; charset=utf-8",
+                "Cache-Control": "no-store",
+                "Pragma": "no-cache",
+            },
+        )
+
+    headers = {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Pragma": "no-cache",
+        "X-SubMux-Source": sub["name"],
+        "X-SubMux-Upstream-Status": str(result["status"]),
+    }
+    upstream_type = result["headers"].get("content-type")
+    if upstream_type:
+        headers["X-SubMux-Upstream-Content-Type"] = upstream_type
+
+    return Response(content=result["body"], status_code=result["status"], headers=headers)
+
+
 @app.post("/api/subscriptions/{sub_id}/test", dependencies=[Depends(require_admin)])
 async def api_test_subscription(sub_id: int):
     with db() as con:

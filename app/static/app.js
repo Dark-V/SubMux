@@ -36,6 +36,7 @@ function renderSubs(){
       </div>
       <div class="item-actions">
         <button class="ghost" onclick="testSub(${s.id})">Проверить</button>
+        <button class="ghost" onclick="window.open('/api/subscriptions/${s.id}/raw','_blank','noopener')">RAW</button>
         <button class="ghost" onclick="editSub(${s.id})">Изменить</button>
         <button class="danger" onclick="deleteSub(${s.id})">Удалить</button>
       </div>
