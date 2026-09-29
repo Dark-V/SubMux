@@ -11,3 +11,75 @@
 .tiny{padding:6px 9px;font-size:12px}.token-url{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;margin-top:6px}.token-value{user-select:all}
 
 .checks label{padding:7px 9px;border:1px solid var(--border);border-radius:8px;background:var(--panel);cursor:pointer}.checks label:has(input:checked){border-color:var(--accent)}
+
+
+/* Token bundle cards */
+#tokensList .item{
+  display:block;
+  min-width:0;
+  padding:15px;
+}
+#tokensList .item > .item-body{
+  min-width:0;
+  width:100%;
+}
+#tokensList .item-title{
+  margin-bottom:8px;
+}
+#tokensList .item-meta{
+  word-break:normal;
+  overflow-wrap:anywhere;
+}
+#tokensList .token-value,
+#tokensList .token-url{
+  width:100%;
+  min-width:0;
+  overflow-wrap:anywhere;
+  word-break:break-word;
+}
+#tokensList .token-value{
+  margin-top:10px;
+  padding:9px 10px;
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:8px;
+  line-height:1.45;
+}
+#tokensList .token-url{
+  margin-top:7px;
+  padding:0 2px;
+}
+#tokensList .item-actions{
+  width:100%;
+  max-width:none;
+  margin-top:13px;
+  padding-top:12px;
+  border-top:1px solid var(--border);
+  display:flex;
+  flex-wrap:wrap;
+  gap:7px;
+  justify-content:flex-start;
+}
+#tokensList .item-actions button{
+  flex:0 0 auto;
+  white-space:nowrap;
+}
+#tokensList .badge{
+  flex:0 0 auto;
+}
+@media(max-width:520px){
+  #tokensList .item-actions button{
+    flex:1 1 auto;
+  }
+  #tokensList .token-value{
+    font-size:11px;
+  }
+}
+
+/* Source cards should never collapse their text column either. */
+#subsList .item > div:first-child{
+  min-width:0;
+}
+#subsList .item-meta{
+  overflow-wrap:anywhere;
+}

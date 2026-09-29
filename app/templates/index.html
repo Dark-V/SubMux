@@ -4,6 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>SubMux</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <meta name="theme-color" content="#151a21">
   <link rel="stylesheet" href="/static/app.css">
   <script>document.documentElement.dataset.theme=localStorage.getItem('submux-theme')||'auto';</script>
 </head>
@@ -25,7 +27,7 @@
 
   <section class="grid two">
     <div class="card">
-      <div class="section-head"><div><h2 id="subFormTitle">Добавить подписку</h2><p class="muted">Минимум: URL, HWID и User-Agent.</p></div></div>
+      <div class="section-head"><div><h2 id="subFormTitle">Добавить подписку</h2><p class="muted">Минимум: URL и User-Agent. HWID и device-заголовки — опционально.</p></div></div>
       <form id="subForm" class="form-grid">
         <input id="subId" type="hidden">
         <label>Название<input id="subName" placeholder="superpupervpn" required maxlength="64"></label>

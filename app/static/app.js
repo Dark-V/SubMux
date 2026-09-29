@@ -61,8 +61,8 @@ function renderTokens(){
       const u=`${location.origin}/${t.token}/sub/${encodeURIComponent(s.name)}`;
       return `<button class="ghost tiny" onclick="copyText('${escapeHtml(u)}')">${escapeHtml(s.name)}</button>`;
     }).join('');
-    return `<div class="item">
-      <div>
+    return `<div class="item token-card">
+      <div class="item-body">
         <div class="item-title">${escapeHtml(t.label)} <span class="badge ${t.enabled?'ok':''}">${t.enabled?'active':'disabled'}</span></div>
         <div class="item-meta"><strong>Состав:</strong> ${escapeHtml(scope)}</div>
         <div class="token-value" title="Токен доступа">${escapeHtml(t.token)}</div>
