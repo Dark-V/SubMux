@@ -11,7 +11,7 @@ import secrets
 import socket
 import sqlite3
 import time
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -605,6 +605,69 @@ def merged_userinfo(results: list[dict[str, Any]]) -> str | None:
 
     return "; ".join(parts) if parts else None
 
+def is_service_placeholder_uri(uri: str) -> bool:
+    """Detect provider informational entries that are not real proxy nodes.
+
+    Many subscription providers encode notices such as "subscription expired"
+    as VLESS/Trojan-style links with an all-zero credential. Treat those as
+    metadata rather than usable nodes.
+    """
+    try:
+        parsed = urlsplit(uri.strip())
+        scheme = parsed.scheme.lower()
+
+        if scheme == "vmess":
+            payload = uri.split("://", 1)[1].split("#", 1)[0]
+            padded = payload + "=" * (-len(payload) % 4)
+            obj = json.loads(base64.b64decode(padded).decode("utf-8"))
+            credential = str(obj.get("id", ""))
+        else:
+            credential = unquote(parsed.username or "")
+
+        compact = re.sub(r"[^0-9A-Fa-f]", "", credential)
+        return len(compact) >= 16 and bool(compact) and set(compact) == {"0"}
+    except Exception:
+        return False
+
+
+def analyze_subscription_payload(body: bytes, forced_format: str) -> dict[str, Any]:
+    try:
+        content, was_base64 = maybe_decode_base64(body, forced_format)
+    except Exception:
+        return {
+            "proxy_count": None,
+            "service_count": 0,
+            "is_uri_list": False,
+            "base64": forced_format == "base64",
+        }
+
+    if content and not looks_like_uri_list(content):
+        return {
+            "proxy_count": None,
+            "service_count": 0,
+            "is_uri_list": False,
+            "base64": was_base64,
+        }
+
+    proxy_count = 0
+    service_count = 0
+    for raw in content.replace("\r\n", "\n").split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        if is_service_placeholder_uri(line):
+            service_count += 1
+        else:
+            proxy_count += 1
+
+    return {
+        "proxy_count": proxy_count,
+        "service_count": service_count,
+        "is_uri_list": True,
+        "base64": was_base64,
+    }
+
+
 def proxy_identity_key(uri: str) -> str:
     """Semantic identity for URI-style proxy entries.
 
@@ -638,6 +701,7 @@ def merge_payloads(results: list[dict[str, Any]]) -> tuple[bytes, dict[str, str]
     items: list[str] = []
     seen: set[str] = set()
     all_base64 = True
+    filtered_service = 0
 
     for result in results:
         content, was_base64 = maybe_decode_base64(result["body"], result["sub"]["format"])
@@ -655,6 +719,9 @@ def merge_payloads(results: list[dict[str, Any]]) -> tuple[bytes, dict[str, str]
         for line in content.replace("\r\n", "\n").split("\n"):
             line = line.strip()
             if not line:
+                continue
+            if is_service_placeholder_uri(line):
+                filtered_service += 1
                 continue
             key = proxy_identity_key(line)
             if key in seen:
@@ -677,6 +744,8 @@ def merge_payloads(results: list[dict[str, Any]]) -> tuple[bytes, dict[str, str]
         "Profile-Title": f"base64:{title}",
         "Profile-Update-Interval": "3",
         "X-SubMux-Sources": ",".join(r["sub"]["name"] for r in results),
+        "X-SubMux-Nodes": str(len(items)),
+        "X-SubMux-Filtered-Service": str(filtered_service),
         "Cache-Control": "no-store",
         "Pragma": "no-cache",
     }
@@ -819,7 +888,24 @@ def api_config(request: Request):
 def api_subscriptions():
     with db() as con:
         rows = con.execute("SELECT * FROM subscriptions ORDER BY id").fetchall()
-        return [row_dict(r) for r in rows]
+
+    result = []
+    for row in rows:
+        sub = row_dict(row)
+        cached = get_cached_source(sub, allow_stale=True)
+        sub["proxy_count"] = None
+        sub["service_count"] = 0
+        sub["cache_age"] = None
+        sub["cache_stale"] = False
+
+        if cached:
+            stats = analyze_subscription_payload(cached["body"], sub["format"])
+            sub.update(stats)
+            sub["cache_age"] = cached["cache_age"]
+            sub["cache_stale"] = bool(cached.get("stale"))
+
+        result.append(sub)
+    return result
 
 
 @app.post("/api/subscriptions", dependencies=[Depends(require_admin)])
@@ -934,6 +1020,85 @@ async def api_raw_subscription(sub_id: int):
     return Response(content=result["body"], status_code=result["status"], headers=headers)
 
 
+@app.post("/api/subscriptions/{sub_id}/refresh", dependencies=[Depends(require_admin)])
+async def api_refresh_subscription(sub_id: int):
+    with db() as con:
+        row = con.execute("SELECT * FROM subscriptions WHERE id = ?", (sub_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    sub = row_dict(row)
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+        result = await get_or_refresh_source(client, sub, force=True)
+
+    if not result["ok"]:
+        raise HTTPException(
+            status_code=502,
+            detail=result["error"] or f"Upstream HTTP {result['status']}",
+        )
+
+    stats = analyze_subscription_payload(result["body"], sub["format"])
+    rebuilt = await rebuild_bundles_for_subscription(sub_id)
+
+    return {
+        "ok": True,
+        "status": result["status"],
+        "bytes": len(result["body"]),
+        "proxy_count": stats["proxy_count"],
+        "service_count": stats["service_count"],
+        "stale": bool(result.get("stale")),
+        "refresh_error": result.get("refresh_error"),
+        "rebuilt_bundles": rebuilt,
+    }
+
+
+@app.post("/api/subscriptions/refresh-all", dependencies=[Depends(require_admin)])
+async def api_refresh_all_subscriptions():
+    with db() as con:
+        rows = con.execute(
+            "SELECT * FROM subscriptions WHERE enabled=1 ORDER BY id"
+        ).fetchall()
+    subs = [row_dict(row) for row in rows]
+
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+        results = await asyncio.gather(
+            *(get_or_refresh_source(client, sub, force=True) for sub in subs)
+        )
+
+    refreshed = 0
+    stale = 0
+    failed = []
+    proxy_count = 0
+    service_count = 0
+
+    for result in results:
+        if result["ok"]:
+            refreshed += 1
+            if result.get("stale"):
+                stale += 1
+            stats = analyze_subscription_payload(
+                result["body"], result["sub"]["format"]
+            )
+            if stats["proxy_count"] is not None:
+                proxy_count += stats["proxy_count"]
+            service_count += stats["service_count"]
+        else:
+            failed.append(result["sub"]["name"])
+
+    rebuilt = await rebuild_all_bundle_caches()
+    return {
+        "ok": not failed,
+        "sources": len(subs),
+        "refreshed": refreshed,
+        "stale": stale,
+        "failed": failed,
+        "proxy_count": proxy_count,
+        "service_count": service_count,
+        "rebuilt_bundles": rebuilt,
+    }
+
+
+# Kept for backward compatibility; unlike refresh, this does not update cache.
 @app.post("/api/subscriptions/{sub_id}/test", dependencies=[Depends(require_admin)])
 async def api_test_subscription(sub_id: int):
     with db() as con:
@@ -943,12 +1108,15 @@ async def api_test_subscription(sub_id: int):
     sub = row_dict(row)
     async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
         result = await fetch_one(client, sub)
+    stats = analyze_subscription_payload(result["body"], sub["format"]) if result["ok"] else {}
     return {
         "ok": result["ok"],
         "status": result["status"],
         "bytes": len(result["body"]),
         "content_type": result["headers"].get("content-type"),
         "profile_title": result["headers"].get("profile-title"),
+        "proxy_count": stats.get("proxy_count"),
+        "service_count": stats.get("service_count", 0),
         "error": result["error"],
     }
 
@@ -1040,16 +1208,6 @@ async def build_public_payload(
         )
 
     stale = [r for r in results if r.get("stale")]
-    if len(results) == 1:
-        result = results[0]
-        headers = response_headers_from_upstream(result["headers"])
-        if result.get("stale"):
-            headers["X-SubMux-Stale"] = result["sub"]["name"]
-        if result["error"]:
-            body = f"Upstream connection error: {result['error']}".encode()
-            return 502, body, {"Content-Type": "text/plain; charset=utf-8"}
-        return int(result["status"]), result["body"], headers
-
     good = [r for r in results if r["ok"]]
     failed = [r for r in results if not r["ok"]]
     if not good:
@@ -1116,6 +1274,49 @@ async def refresh_bundle_cache(
             )
 
         return status, body, headers, "ERROR", 0
+
+
+async def rebuild_token_bundle(token: dict[str, Any]) -> bool:
+    subs = allowed_subscriptions(token)
+    if not subs:
+        return False
+
+    fingerprint = bundle_fingerprint(token, subs)
+    lock = _BUNDLE_LOCKS.setdefault(token["id"], asyncio.Lock())
+    async with lock:
+        status, body, headers = await build_public_payload(
+            token, subs, force_sources=False
+        )
+        if 200 <= status < 300:
+            store_cached_bundle(token, fingerprint, body, headers, status)
+            return True
+    return False
+
+
+async def rebuild_bundles_for_subscription(subscription_id: int) -> int:
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT DISTINCT t.*
+            FROM tokens t
+            LEFT JOIN token_subscriptions ts ON ts.token_id=t.id
+            WHERE t.enabled=1
+              AND (t.scope_all=1 OR ts.subscription_id=?)
+            ORDER BY t.id
+            """,
+            (subscription_id,),
+        ).fetchall()
+    tokens = [row_dict(row) for row in rows]
+    results = await asyncio.gather(*(rebuild_token_bundle(token) for token in tokens))
+    return sum(1 for ok in results if ok)
+
+
+async def rebuild_all_bundle_caches() -> int:
+    with db() as con:
+        rows = con.execute("SELECT * FROM tokens WHERE enabled=1 ORDER BY id").fetchall()
+    tokens = [row_dict(row) for row in rows]
+    results = await asyncio.gather(*(rebuild_token_bundle(token) for token in tokens))
+    return sum(1 for ok in results if ok)
 
 
 async def refresh_all_bundle_caches() -> None:
