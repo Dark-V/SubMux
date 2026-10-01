@@ -12,7 +12,7 @@ import socket
 import sqlite3
 import time
 from urllib.parse import parse_qsl, unquote, urlsplit
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -25,6 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 APP_NAME = "SubMux"
+APP_VERSION = os.getenv("SUBMUX_VERSION", "0.1.0").strip() or "0.1.0"
 ADMIN_PORT = int(os.getenv("ADMIN_PORT", os.getenv("PORT", "8080")))
 PUBLIC_PORT = int(os.getenv("PUBLIC_PORT", "8081"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
@@ -754,7 +755,32 @@ def merge_payloads(results: list[dict[str, Any]]) -> tuple[bytes, dict[str, str]
         headers["Subscription-Userinfo"] = userinfo
     return body, headers
 
-app = FastAPI(title=APP_NAME, docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global _CACHE_REFRESH_TASK
+
+    if _CACHE_REFRESH_TASK is None or _CACHE_REFRESH_TASK.done():
+        _CACHE_REFRESH_TASK = asyncio.create_task(cache_refresh_loop())
+
+    try:
+        yield
+    finally:
+        if _CACHE_REFRESH_TASK is not None:
+            _CACHE_REFRESH_TASK.cancel()
+            try:
+                await _CACHE_REFRESH_TASK
+            except asyncio.CancelledError:
+                pass
+            _CACHE_REFRESH_TASK = None
+
+
+app = FastAPI(
+    title=APP_NAME,
+    version=APP_VERSION,
+    docs_url=None,
+    redoc_url=None,
+    lifespan=lifespan,
+)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 legacy_import()
 
@@ -815,7 +841,7 @@ async def listener_isolation(request: Request, call_next):
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok", "service": APP_NAME}
+    return {"status": "ok", "service": APP_NAME, "version": APP_VERSION}
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -1361,25 +1387,6 @@ async def cache_refresh_loop() -> None:
         await refresh_all_bundle_caches()
 
 
-@app.on_event("startup")
-async def start_cache_refresh_task():
-    global _CACHE_REFRESH_TASK
-    if _CACHE_REFRESH_TASK is None or _CACHE_REFRESH_TASK.done():
-        _CACHE_REFRESH_TASK = asyncio.create_task(cache_refresh_loop())
-
-
-@app.on_event("shutdown")
-async def stop_cache_refresh_task():
-    global _CACHE_REFRESH_TASK
-    if _CACHE_REFRESH_TASK is not None:
-        _CACHE_REFRESH_TASK.cancel()
-        try:
-            await _CACHE_REFRESH_TASK
-        except asyncio.CancelledError:
-            pass
-        _CACHE_REFRESH_TASK = None
-
-
 async def serve_public(request: Request, name: str | None = None, path_token: str | None = None) -> Response:
     token_value = extract_token(request, path_token)
     token = get_token_record(token_value)
@@ -1493,8 +1500,9 @@ if __name__ == "__main__":
 
     sockets = [bind_listener(ADMIN_PORT), bind_listener(PUBLIC_PORT)]
     print(
-        f"[SubMux] admin listener: 0.0.0.0:{ADMIN_PORT}; "
-        f"public listener: 0.0.0.0:{PUBLIC_PORT}",
+        f"[SubMux {APP_VERSION}] admin listener: 0.0.0.0:{ADMIN_PORT}; "
+        f"public listener: 0.0.0.0:{PUBLIC_PORT}; "
+        f"cache TTL: {CACHE_TTL_SECONDS}s",
         flush=True,
     )
     config = uvicorn.Config(app, proxy_headers=True, log_level="info")
