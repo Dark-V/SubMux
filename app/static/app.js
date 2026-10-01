@@ -73,23 +73,15 @@ function renderTokens(){
     const scope=t.scope_all?'все текущие и будущие источники':(allowed.map(s=>s.name).join(' + ')||'нет источников');
     const publicBase=(appConfig.public_base_url||location.origin).replace(/\/$/,'');
     const shortUrl=`${publicBase}/${t.token}/`;
-    const subsUrl=`${publicBase}/${t.token}/subs`;
-    const namedButtons=allowed.map(s=>{
-      const u=`${publicBase}/${t.token}/sub/${encodeURIComponent(s.name)}`;
-      return `<button class="ghost tiny" onclick="copyText('${escapeHtml(u)}')">${escapeHtml(s.name)}</button>`;
-    }).join('');
     return `<div class="item token-card">
       <div class="item-body">
         <div class="item-title">${escapeHtml(t.label)} <span class="badge ${t.enabled?'ok':''}">${t.enabled?'active':'disabled'}</span></div>
         <div class="item-meta"><strong>Состав:</strong> ${escapeHtml(scope)}</div>
-        <div class="token-value" title="Токен доступа">${escapeHtml(t.token)}</div>
-        <div class="item-meta token-url">${escapeHtml(shortUrl)}</div>
+        <div class="token-value copyable" title="Нажмите, чтобы скопировать токен" onclick="copyText('${escapeHtml(t.token)}')">${escapeHtml(t.token)}</div>
+        <div class="item-meta token-url copyable" title="Нажмите, чтобы скопировать URL" onclick="copyText('${escapeHtml(shortUrl)}')">${escapeHtml(shortUrl)}</div>
       </div>
       <div class="item-actions">
-        <button class="ghost" onclick="copyText('${escapeHtml(t.token)}')">Токен</button>
-        <button class="ghost" onclick="copyText('${escapeHtml(shortUrl)}')">Короткий URL</button>
-        <button class="ghost" onclick="copyText('${escapeHtml(subsUrl)}')">/subs URL</button>
-        ${namedButtons}
+        <button class="ghost" onclick="copyText('${escapeHtml(shortUrl)}')">URL</button>
         <button class="ghost" onclick="editToken(${t.id})">Состав</button>
         <button class="ghost" onclick="toggleToken(${t.id},${!t.enabled})">${t.enabled?'Выключить':'Включить'}</button>
         <button class="danger" onclick="deleteToken(${t.id})">Удалить</button>
