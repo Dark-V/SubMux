@@ -1,150 +1,137 @@
 # SubMux
 
-SubMux is a small self-hosted subscription multiplexer. It fetches one or more upstream proxy subscriptions with per-source `User-Agent`, `X-HWID` and optional device headers, then exposes them through token-protected endpoints.
+Self-hosted proxy subscription multiplexer with a web panel.
 
-The web panel includes light/dark themes, subscription management, upstream tests and access-token ACLs.
+SubMux can combine several upstream subscriptions into one token-protected URL, cache them, remove duplicate proxy nodes, and keep the admin panel separate from the public subscription listener.
 
-## Endpoints
+## Features
 
-Every public subscription request requires a token.
+- multiple upstream subscriptions;
+- per-source `User-Agent`, HWID and device headers;
+- token bundles with selected sources;
+- VLESS / VMess / Trojan / SS URI-list merge;
+- semantic deduplication of the same endpoint;
+- filters service placeholder nodes with all-zero credentials;
+- persistent 30-minute cache by default;
+- manual refresh from the web panel or `?forceUpdate=1`;
+- stale-cache fallback when an upstream is temporarily unavailable;
+- separate admin and public ports.
 
-```text
-GET /<TOKEN>/
-GET /<TOKEN>/?forceUpdate=1
-GET /<TOKEN>/subs
-GET /<TOKEN>/sub/<name>
-GET /subs?token=<TOKEN>
-GET /sub/<name>?token=<TOKEN>
-Authorization: Bearer <TOKEN>
-```
-
-`/<TOKEN>/` and `/subs` return all subscriptions allowed by that token. `/sub/<name>` returns only the named upstream subscription. Add `?forceUpdate=1` to an aggregate or named URL to bypass the cache and refresh the required upstream source(s) immediately.
-
-Tokens can either:
-
-- access all current and future subscriptions;
-- access only selected subscriptions.
-
-## Quick start
-
-```bash
-git clone https://github.com/Dark-V/SubMux.git
-cd SubMux
-# optional: cp .env.example .env and set ADMIN_TOKEN
-docker compose pull
-docker compose up -d
-```
-
-Open `http://HOST:8080/`, sign in with `ADMIN_TOKEN`, then add a subscription.
-
-Example source:
-
-```text
-Name: superpupervpn
-URL: https://provider.example/subscription/...
-User-Agent: v2raytun/android
-HWID: YOUR_DEVICE_HWID
-```
-
-The public URLs will look like:
-
-```text
-http://HOST:8080/1fdsf3fhgds3d.../
-http://HOST:8080/1fdsf3fhgds3d.../subs
-http://HOST:8080/1fdsf3fhgds3d.../sub/superpupervpn
-```
-
-## Docker
-
-Published images are built for `linux/amd64` and `linux/arm64`:
-
-```text
-ghcr.io/dark-v/submux:latest
-```
-
-Minimal compose:
+## Docker Compose
 
 ```yaml
 services:
   submux:
     image: ghcr.io/dark-v/submux:latest
+    container_name: submux
     restart: unless-stopped
+    pull_policy: always
+    init: true
+
     ports:
-      - "8080:8080"
+      # Admin panel
+      - "81:8080"
+
+      # Public subscription listener / reverse-proxy backend
+      - "8081:8081"
+
     environment:
-      ADMIN_TOKEN: "replace-with-a-long-random-value"
+      ADMIN_PORT: "8080"
+      PUBLIC_PORT: "8081"
+
+      # Optional external URL used by Copy URL buttons.
+      # Example: https://sub.example.com
+      PUBLIC_BASE_URL: ""
+
+      # Leave empty to auto-generate and persist a token in /data/admin_token.
+      ADMIN_TOKEN: ""
+
+      # Use 0 for a LAN HTTP admin panel.
+      COOKIE_SECURE: "0"
+
+      # Cache TTL in seconds. 1800 = 30 minutes.
       CACHE_TTL_SECONDS: "1800"
+
     volumes:
       - submux-data:/data
+
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   submux-data:
 ```
 
-If `ADMIN_TOKEN` is omitted, SubMux generates one, stores it in `/data/admin_token`, and prints it once to the container log.
+Start:
 
-## Legacy env import
-
-For migration from the original single-upstream container, SubMux understands these environment variables on an empty database:
-
-```yaml
-environment:
-  UPSTREAM_URL: "https://provider.example/subscription/..."
-  INITIAL_SUB_NAME: "main"
-  USER_AGENT: "v2raytun/android"
-  HWID: "YOUR_HWID"
-  DEVICE_OS: "Android"
-  VER_OS: "Android 15"
-  DEVICE_MODEL: "Device model"
-  APP_VERSION: "5.23.74"
+```bash
+docker compose pull
+docker compose up -d
 ```
 
-They are imported into SQLite on first start. Do not commit real subscription URLs or HWIDs to Git.
+Admin panel:
+
+```text
+http://HOST:81/
+```
+
+If `ADMIN_TOKEN` is empty:
+
+```bash
+docker exec submux cat /data/admin_token
+```
+
+Public listener:
+
+```text
+http://HOST:8081/
+```
+
+For a reverse proxy, point it only to `HOST:8081`. The public listener does not expose `/admin`, `/login` or `/api/*`.
+
+## Subscription URLs
+
+```text
+/TOKEN/
+/TOKEN/subs
+/TOKEN/sub/NAME
+/subs?token=TOKEN
+/sub/NAME?token=TOKEN
+```
+
+Force an immediate refresh:
+
+```text
+/TOKEN/?forceUpdate=1
+```
+
+Normal requests use the persistent cache in `/data/submux.db`.
 
 ## Merge behavior
 
-For a named endpoint, SubMux returns that upstream body unchanged and forwards the useful subscription headers.
+Aggregate URLs merge URI-list subscriptions and remove duplicate endpoints. Different UUIDs or display names do not create duplicates when the actual endpoint and transport are the same.
 
-For aggregate endpoints, upstreams are fetched concurrently when the cache needs refresh. SubMux safely merges URI-list subscriptions (for example VLESS/VMess/Trojan/SS links) in either raw or base64 form. It decodes base64 lists, removes semantic duplicates, and re-encodes the result when every source is base64.
+The same display name on different IPs remains separate.
 
-Duplicate identity ignores URI credentials/userinfo (for example different VLESS UUIDs) and the display fragment after `#`, while preserving scheme, host/IP, port, path and transport/security query parameters. Therefore the same endpoint from two accounts collapses to the first entry in bundle order, but the same display name on different IPs remains two distinct profiles.
-
-Arbitrary YAML/JSON configs are intentionally **not** line-merged because that would corrupt them. They remain available through the named pass-through endpoint `/sub/<name>`. Use the per-source format setting only to disambiguate URI-list encoding.
-
-`Subscription-Userinfo` is combined where available. `upload` and `download` are summed, finite totals are summed, `total=0` remains unlimited, and the earliest non-zero expiry is used.
-
-## Cache behavior
-
-SubMux keeps both per-source and per-bundle caches persistently in `/data/submux.db`. The default TTL is 1800 seconds (30 minutes) and can be changed with `CACHE_TTL_SECONDS`.
-
-A normal request returns the cached bundle without contacting upstream while it is fresh. A background worker checks for expired bundles once per minute and refreshes them. Overlapping bundles reuse fresh per-source cache entries, so a source shared by several tokens is not fetched repeatedly during the same refresh window.
-
-`?forceUpdate=1` bypasses the TTL for that request, re-fetches every source required by the selected bundle, updates source cache, rebuilds the bundle and stores the new bundle cache.
-
-If a source refresh fails but a previous good source cache exists, SubMux uses that stale copy and marks the response with `X-SubMux-Stale`. If an entire refresh fails but a previous bundle for the same configuration exists, that bundle is served with `X-SubMux-Cache: STALE`.
-
-Useful response headers:
+Service entries that use an all-zero credential, for example:
 
 ```text
-X-SubMux-Cache: HIT | REFRESH | STALE | ERROR
-X-SubMux-Cache-Age: <seconds>
-X-SubMux-Stale: <source names, if any>
+00000000-0000-0000-0000-000000000000
 ```
 
-## Security notes
+are filtered from aggregate subscriptions.
 
-A subscription token is a bearer credential. Path/query tokens are supported because many proxy clients only accept URL-based credentials, but they can appear in reverse-proxy access logs and browser history. `Authorization: Bearer` is also supported when the client allows it.
+Named URLs such as `/TOKEN/sub/NAME` remain pass-through and return the original upstream subscription.
 
-The admin panel is protected separately by `ADMIN_TOKEN`. With HTTPS behind a reverse proxy, set `COOKIE_SECURE=1`.
+YAML/JSON configs are not merged; use the named pass-through URL for them.
 
-## Build locally
+## Image
 
-```bash
-docker build -t submux:local .
-docker run --rm -p 8080:8080 -e ADMIN_TOKEN=test -v submux-data:/data submux:local
+```text
+ghcr.io/dark-v/submux:latest
 ```
 
-Every push to `main` also runs a runtime smoke-test before the multi-architecture image is published. The smoke-test boots the container, checks the admin login/API, adds two mock upstreams, verifies aggregate output, verifies a subscription-scoped token, and only then pushes the image.
+Architectures: `linux/amd64`, `linux/arm64`.
 
 ## License
 
