@@ -36,19 +36,27 @@ function renderSubs(){
   $('#subCount').textContent = `${subscriptions.length} подписок`;
   const box = $('#subsList');
   if (!subscriptions.length){ box.innerHTML='<div class="empty">Источников пока нет.</div>'; return; }
-  box.innerHTML = subscriptions.map(s=>`
+  box.innerHTML = subscriptions.map(s=>{
+    const nodes = s.proxy_count == null ? 'кэш ещё не создан' : `${s.proxy_count} узлов`;
+    const service = s.service_count > 0
+      ? ` <span class="badge warn">служебных: ${s.service_count}</span>`
+      : '';
+    const stale = s.cache_stale ? ' <span class="badge warn">cache stale</span>' : '';
+    return `
     <div class="item">
       <div>
-        <div class="item-title">${escapeHtml(s.name)} <span class="badge ${s.enabled?'ok':''}">${s.enabled?'active':'disabled'}</span><span class="badge">${escapeHtml(s.format)}</span></div>
+        <div class="item-title">${escapeHtml(s.name)} <span class="badge ${s.enabled?'ok':''}">${s.enabled?'active':'disabled'}</span><span class="badge">${escapeHtml(s.format)}</span>${service}${stale}</div>
         <div class="item-meta">${escapeHtml(s.url)}</div>
+        <div class="item-meta"><strong>${escapeHtml(nodes)}</strong>${s.cache_age == null ? '' : ` · кэш ${s.cache_age} сек.`}</div>
       </div>
       <div class="item-actions">
-        <button class="ghost" onclick="testSub(${s.id})">Проверить</button>
+        <button class="ghost" onclick="refreshSub(${s.id})">Обновить</button>
         <button class="ghost" onclick="window.open('/api/subscriptions/${s.id}/raw','_blank','noopener')">RAW</button>
         <button class="ghost" onclick="editSub(${s.id})">Изменить</button>
         <button class="danger" onclick="deleteSub(${s.id})">Удалить</button>
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 
 function renderScopes(){
@@ -117,7 +125,27 @@ window.editSub=id=>{
   $('#subFormTitle').textContent='Изменить подписку'; $('#subCancel').classList.remove('hidden'); scrollTo({top:0,behavior:'smooth'});
 };
 window.deleteSub=async id=>{if(!confirm('Удалить подписку?'))return;try{await api(`/api/subscriptions/${id}`,{method:'DELETE'});await loadAll();flash('Подписка удалена.')}catch(e){flash(e.message,'error')}};
-window.testSub=async id=>{try{const r=await api(`/api/subscriptions/${id}/test`,{method:'POST'});flash(r.ok?`Upstream OK: HTTP ${r.status}, ${r.bytes} bytes`:`Ошибка upstream: ${r.error||'HTTP '+r.status}`,r.ok?'success':'error')}catch(e){flash(e.message,'error')}};
+window.refreshSub=async id=>{
+  try{
+    flash('Обновляю источник и связанные сборки...');
+    const r=await api(`/api/subscriptions/${id}/refresh`,{method:'POST'});
+    await loadAll();
+    const service=r.service_count? `, служебных отброшено: ${r.service_count}` : '';
+    const stale=r.stale? ' (использован старый кэш)' : '';
+    flash(`Обновлено: ${r.proxy_count ?? '?'} узлов${service}; сборок: ${r.rebuilt_bundles}${stale}`,r.stale?'error':'success');
+  }catch(e){flash(e.message,'error')}
+};
+
+$('#refreshAllBtn')?.addEventListener('click',async()=>{
+  try{
+    flash('Обновляю все источники...');
+    const r=await api('/api/subscriptions/refresh-all',{method:'POST'});
+    await loadAll();
+    const failed=r.failed?.length ? `; ошибки: ${r.failed.join(', ')}` : '';
+    const service=r.service_count ? `; служебных отброшено: ${r.service_count}` : '';
+    flash(`Обновлено источников: ${r.refreshed}/${r.sources}; узлов: ${r.proxy_count}${service}; сборок: ${r.rebuilt_bundles}${failed}`,r.failed?.length?'error':'success');
+  }catch(e){flash(e.message,'error')}
+});
 
 function syncScopeVisibility(){
   $('#scopeBox').classList.toggle('hidden',$('#scopeAll').checked);
