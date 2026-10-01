@@ -22,7 +22,7 @@ jobs:
           set -euo pipefail
 
           mkdir -p /tmp/submux-mock
-          printf 'vless://user-a@dup.example:443?security=reality&type=tcp&sni=example.com#A\nvless://user-one@one.example:443?security=reality&type=tcp#one\n' | base64 -w0 > /tmp/submux-mock/one.txt
+          printf 'vless://00000000-0000-0000-0000-000000000000@notice.example:443?security=reality&type=tcp#Subscription-expired\nvless://user-a@dup.example:443?security=reality&type=tcp&sni=example.com#A\nvless://user-one@one.example:443?security=reality&type=tcp#one\n' | base64 -w0 > /tmp/submux-mock/one.txt
           printf 'vless://user-b@dup.example:443?type=tcp&sni=example.com&security=reality#B\nvless://user-two@two.example:443?security=reality&type=tcp#two\n' | base64 -w0 > /tmp/submux-mock/two.txt
           python3 -m http.server 19090 --bind 0.0.0.0 --directory /tmp/submux-mock >/tmp/submux-mock.log 2>&1 &
           MOCK_PID=$!
@@ -86,6 +86,12 @@ jobs:
           grep -q 'user-two@two.example:443' /tmp/submux-merged.txt
           test "$(grep -c 'dup.example:443' /tmp/submux-merged.txt)" -eq 1
           grep -q 'user-a@dup.example:443' /tmp/submux-merged.txt
+          if grep -q 'notice.example:443' /tmp/submux-merged.txt; then
+            echo "Service placeholder node was not removed" >&2
+            exit 1
+          fi
+          grep -qi '^x-submux-filtered-service: 1' /tmp/submux-h1
+          grep -qi '^x-submux-nodes: 3' /tmp/submux-h1
           if grep -q 'user-b@dup.example:443' /tmp/submux-merged.txt; then
             echo "Semantic duplicate was not removed" >&2
             exit 1
@@ -101,6 +107,41 @@ jobs:
           grep -qi '^x-submux-cache: REFRESH' /tmp/submux-h3
           cmp /tmp/submux-body1 /tmp/submux-body3
 
+          # Admin refresh must update source cache, report node/service counts,
+          # and rebuild all bundles that use this source.
+          curl -fsS -b /tmp/submux-cookies -X POST \
+            http://127.0.0.1:18081/api/subscriptions/1/refresh > /tmp/refresh-result.json
+          python3 - <<'PY'
+          import json
+          data=json.load(open('/tmp/refresh-result.json'))
+          assert data['ok'] is True, data
+          assert data['proxy_count'] == 2, data
+          assert data['service_count'] == 1, data
+          assert data['rebuilt_bundles'] >= 1, data
+          PY
+
+          curl -fsS -b /tmp/submux-cookies \
+            http://127.0.0.1:18081/api/subscriptions > /tmp/subscriptions.json
+          python3 - <<'PY'
+          import json
+          data=json.load(open('/tmp/subscriptions.json'))
+          one=next(x for x in data if x['name']=='one')
+          assert one['proxy_count'] == 2, one
+          assert one['service_count'] == 1, one
+          PY
+
+          # Refresh-all endpoint is the admin-side equivalent of force-refreshing
+          # every enabled source and then rebuilding all active bundles.
+          curl -fsS -b /tmp/submux-cookies -X POST \
+            http://127.0.0.1:18081/api/subscriptions/refresh-all > /tmp/refresh-all.json
+          python3 - <<'PY'
+          import json
+          data=json.load(open('/tmp/refresh-all.json'))
+          assert data['sources'] == 2, data
+          assert data['refreshed'] == 2, data
+          assert data['service_count'] == 1, data
+          PY
+
           SCOPED=$(curl -fsS -b /tmp/submux-cookies -H 'Content-Type: application/json' \
             -d '{"label":"one-only","scope_all":false,"subscription_ids":[1]}' \
             http://127.0.0.1:18081/api/tokens | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
@@ -108,6 +149,10 @@ jobs:
           curl -fsS "http://127.0.0.1:18082/$SCOPED/" | base64 -d > /tmp/submux-scoped.txt
           grep -q 'user-one@one.example:443' /tmp/submux-scoped.txt
           grep -q 'user-a@dup.example:443' /tmp/submux-scoped.txt
+          if grep -q 'notice.example:443' /tmp/submux-scoped.txt; then
+            echo "Scoped bundle leaked service placeholder" >&2
+            exit 1
+          fi
           if grep -q 'user-two@two.example:443' /tmp/submux-scoped.txt; then
             echo "Scoped token leaked subscription two" >&2
             exit 1
