@@ -53,6 +53,12 @@ jobs:
           done
 
           curl -fsS http://127.0.0.1:18081/healthz | grep -q '"status":"ok"'
+          curl -fsS http://127.0.0.1:18081/healthz | grep -q '"version":"0.1.0"'
+          docker logs submux-smoke 2>&1 | grep -q '\[SubMux 0.1.0\] admin listener:'
+          if docker logs submux-smoke 2>&1 | grep -q 'on_event is deprecated'; then
+            echo "FastAPI on_event deprecation warning is present" >&2
+            exit 1
+          fi
           curl -fsS http://127.0.0.1:18081/login | grep -q 'SubMux'
 
           # Public listener must never expose the admin surface.
