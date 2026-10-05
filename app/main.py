@@ -34,11 +34,14 @@ DB_PATH = DATA_DIR / "submux.db"
 ADMIN_TOKEN_FILE = DATA_DIR / "admin_token"
 COOKIE_NAME = "submux_admin"
 COOKIE_SECURE_MODE = os.getenv("COOKIE_SECURE", "auto").strip().lower()
-CACHE_TTL_SECONDS = max(60, int(os.getenv("CACHE_TTL_SECONDS", "1800")))
+CACHE_TTL_SECONDS = max(10, int(os.getenv("CACHE_TTL_SECONDS", "1800")))
+BURST_REFRESH_REQUESTS = max(2, int(os.getenv("BURST_REFRESH_REQUESTS", "3")))
+BURST_REFRESH_WINDOW_SECONDS = max(10, int(os.getenv("BURST_REFRESH_WINDOW_SECONDS", "60")))
 BASE_DIR = Path(__file__).resolve().parent
 
 _SOURCE_LOCKS: dict[int, asyncio.Lock] = {}
 _BUNDLE_LOCKS: dict[int, asyncio.Lock] = {}
+_PUBLIC_REFRESH_WINDOWS: dict[tuple[int, str], list[float]] = {}
 _CACHE_REFRESH_TASK: asyncio.Task | None = None
 
 FORWARDED_HEADERS = (
@@ -120,8 +123,44 @@ def init_db() -> None:
                 body BLOB NOT NULL,
                 headers_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
+
+
+def load_runtime_settings() -> None:
+    global CACHE_TTL_SECONDS
+    with db() as con:
+        row = con.execute(
+            "SELECT value FROM app_settings WHERE key='cache_ttl_seconds'"
+        ).fetchone()
+    if not row:
+        return
+    try:
+        CACHE_TTL_SECONDS = min(604800, max(10, int(row["value"])))
+    except (TypeError, ValueError):
+        pass
+
+
+def set_cache_ttl_seconds(value: int) -> int:
+    global CACHE_TTL_SECONDS
+    CACHE_TTL_SECONDS = min(604800, max(10, int(value)))
+    with db() as con:
+        con.execute(
+            """
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES ('cache_ttl_seconds', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value,
+                updated_at=excluded.updated_at
+            """,
+            (str(CACHE_TTL_SECONDS), now_iso()),
+        )
+    return CACHE_TTL_SECONDS
 
 
 def get_admin_token() -> str:
@@ -143,6 +182,7 @@ def get_admin_token() -> str:
 
 
 init_db()
+load_runtime_settings()
 ADMIN_TOKEN = get_admin_token()
 ADMIN_COOKIE_VALUE = hashlib.sha256(f"submux:{ADMIN_TOKEN}".encode()).hexdigest()
 
@@ -218,6 +258,10 @@ class TokenPatch(BaseModel):
     enabled: bool | None = None
     scope_all: bool | None = None
     subscription_ids: list[int] | None = None
+
+
+class AppConfigPatch(BaseModel):
+    cache_ttl_seconds: int = Field(ge=10, le=604800)
 
 
 def slugify(value: str) -> str:
@@ -503,14 +547,60 @@ def store_cached_bundle(
 
 def cache_headers(headers: dict[str, str], state: str, age: int = 0) -> dict[str, str]:
     out = dict(headers)
+    normalized_age = max(0, int(age))
     out["X-SubMux-Cache"] = state
-    out["X-SubMux-Cache-Age"] = str(max(0, age))
+    out["X-SubMux-Cache-Age"] = str(normalized_age)
+    out["X-SubMux-Cache-TTL"] = str(CACHE_TTL_SECONDS)
+    out["X-SubMux-Cache-Expires-In"] = str(max(0, CACHE_TTL_SECONDS - normalized_age))
     return out
 
 
 def force_update_requested(request: Request) -> bool:
-    raw = request.query_params.get("forceUpdate", request.query_params.get("forceupdate", ""))
-    return raw.strip().lower() in {"1", "true", "yes", "on", "force"}
+    aliases = {
+        "force",
+        "update",
+        "forceupdate",
+        "refresh",
+        "reload",
+        "force_refresh",
+        "force-refresh",
+    }
+    truthy = {"1", "true", "yes", "on", "force", "update", "refresh", "reload"}
+    for key, value in request.query_params.multi_items():
+        if key.lower() in aliases and value.strip().lower() in truthy:
+            return True
+    return False
+
+
+def public_client_identity(request: Request) -> str:
+    for header in ("cf-connecting-ip", "x-real-ip", "x-forwarded-for"):
+        raw = request.headers.get(header, "").strip()
+        if raw:
+            return raw.split(",", 1)[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def burst_refresh_requested(request: Request, token_id: int) -> bool:
+    now = time.monotonic()
+    key = (token_id, public_client_identity(request))
+    recent = [
+        ts for ts in _PUBLIC_REFRESH_WINDOWS.get(key, [])
+        if now - ts < BURST_REFRESH_WINDOW_SECONDS
+    ]
+    recent.append(now)
+
+    if len(recent) >= BURST_REFRESH_REQUESTS:
+        _PUBLIC_REFRESH_WINDOWS.pop(key, None)
+        return True
+
+    _PUBLIC_REFRESH_WINDOWS[key] = recent
+
+    if len(_PUBLIC_REFRESH_WINDOWS) > 4096:
+        cutoff = now - BURST_REFRESH_WINDOW_SECONDS
+        for old_key, timestamps in list(_PUBLIC_REFRESH_WINDOWS.items()):
+            if not timestamps or timestamps[-1] < cutoff:
+                _PUBLIC_REFRESH_WINDOWS.pop(old_key, None)
+    return False
 
 
 def response_headers_from_upstream(headers: dict[str, str]) -> dict[str, str]:
@@ -743,7 +833,7 @@ def merge_payloads(results: list[dict[str, Any]]) -> tuple[bytes, dict[str, str]
         "Content-Type": "text/plain; charset=utf-8",
         "Content-Disposition": "attachment; filename=submux.txt",
         "Profile-Title": f"base64:{title}",
-        "Profile-Update-Interval": "3",
+        "Profile-Update-Interval": str(max(1, (CACHE_TTL_SECONDS + 3599) // 3600)),
         "X-SubMux-Sources": ",".join(r["sub"]["name"] for r in results),
         "X-SubMux-Nodes": str(len(items)),
         "X-SubMux-Filtered-Service": str(filtered_service),
@@ -907,7 +997,22 @@ def api_config(request: Request):
         "public_port": PUBLIC_PORT,
         "public_base_url": public_base,
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
+        "burst_refresh_requests": BURST_REFRESH_REQUESTS,
+        "burst_refresh_window_seconds": BURST_REFRESH_WINDOW_SECONDS,
+        "force_update_params": [
+            "force=1",
+            "update=1",
+            "forceUpdate=1",
+            "refresh=1",
+            "reload=1",
+        ],
     }
+
+
+@app.patch("/api/config", dependencies=[Depends(require_admin)])
+def api_update_config(item: AppConfigPatch):
+    ttl = set_cache_ttl_seconds(item.cache_ttl_seconds)
+    return {"ok": True, "cache_ttl_seconds": ttl}
 
 
 @app.get("/api/subscriptions", dependencies=[Depends(require_admin)])
@@ -923,12 +1028,15 @@ def api_subscriptions():
         sub["service_count"] = 0
         sub["cache_age"] = None
         sub["cache_stale"] = False
+        sub["cache_ttl_seconds"] = CACHE_TTL_SECONDS
+        sub["cache_expires_in"] = None
 
         if cached:
             stats = analyze_subscription_payload(cached["body"], sub["format"])
             sub.update(stats)
             sub["cache_age"] = cached["cache_age"]
             sub["cache_stale"] = bool(cached.get("stale"))
+            sub["cache_expires_in"] = max(0, CACHE_TTL_SECONDS - cached["cache_age"])
 
         result.append(sub)
     return result
@@ -1048,14 +1156,17 @@ async def api_raw_subscription(sub_id: int):
 
 @app.post("/api/subscriptions/{sub_id}/refresh", dependencies=[Depends(require_admin)])
 async def api_refresh_subscription(sub_id: int):
+    started = time.monotonic()
     with db() as con:
         row = con.execute("SELECT * FROM subscriptions WHERE id = ?", (sub_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Subscription not found")
 
     sub = row_dict(row)
+    upstream_started = time.monotonic()
     async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
         result = await get_or_refresh_source(client, sub, force=True)
+    upstream_elapsed_ms = int((time.monotonic() - upstream_started) * 1000)
 
     if not result["ok"]:
         raise HTTPException(
@@ -1064,7 +1175,9 @@ async def api_refresh_subscription(sub_id: int):
         )
 
     stats = analyze_subscription_payload(result["body"], sub["format"])
+    rebuild_started = time.monotonic()
     rebuilt = await rebuild_bundles_for_subscription(sub_id)
+    rebuild_elapsed_ms = int((time.monotonic() - rebuild_started) * 1000)
 
     return {
         "ok": True,
@@ -1075,6 +1188,10 @@ async def api_refresh_subscription(sub_id: int):
         "stale": bool(result.get("stale")),
         "refresh_error": result.get("refresh_error"),
         "rebuilt_bundles": rebuilt,
+        "upstream_elapsed_ms": upstream_elapsed_ms,
+        "rebuild_elapsed_ms": rebuild_elapsed_ms,
+        "elapsed_ms": int((time.monotonic() - started) * 1000),
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
     }
 
 
@@ -1381,9 +1498,8 @@ async def refresh_all_bundle_caches() -> None:
 
 
 async def cache_refresh_loop() -> None:
-    poll_seconds = min(60, CACHE_TTL_SECONDS)
     while True:
-        await asyncio.sleep(poll_seconds)
+        await asyncio.sleep(min(60, CACHE_TTL_SECONDS))
         await refresh_all_bundle_caches()
 
 
@@ -1401,7 +1517,10 @@ async def serve_public(request: Request, name: str | None = None, path_token: st
     if not subs:
         raise HTTPException(status_code=403, detail="Token has no accessible subscriptions")
 
-    force = force_update_requested(request)
+    query_force = force_update_requested(request)
+    burst_force = False if query_force else burst_refresh_requested(request, token["id"])
+    force = query_force or burst_force
+    refresh_reason = "query" if query_force else ("burst" if burst_force else "")
 
     # Named pass-through endpoints use the persistent per-source cache too.
     if name is not None:
@@ -1422,10 +1541,15 @@ async def serve_public(request: Request, name: str | None = None, path_token: st
         if result.get("stale"):
             state = "STALE"
             headers["X-SubMux-Stale"] = result["sub"]["name"]
+        response_headers = cache_headers(headers, state, age)
+        if refresh_reason:
+            response_headers["X-SubMux-Refresh-Reason"] = refresh_reason
+        elif state == "REFRESH":
+            response_headers["X-SubMux-Refresh-Reason"] = "ttl-or-miss"
         return Response(
             content=result["body"],
             status_code=result["status"],
-            headers=cache_headers(headers, state, age),
+            headers=response_headers,
         )
 
     fingerprint = bundle_fingerprint(token, subs)
@@ -1444,10 +1568,15 @@ async def serve_public(request: Request, name: str | None = None, path_token: st
     status, body, headers, state, age = await refresh_bundle_cache(
         token, subs, force_sources=force
     )
+    response_headers = cache_headers(headers, state, age)
+    if refresh_reason:
+        response_headers["X-SubMux-Refresh-Reason"] = refresh_reason
+    elif state == "REFRESH":
+        response_headers["X-SubMux-Refresh-Reason"] = "ttl-or-miss"
     return Response(
         content=body,
         status_code=status,
-        headers=cache_headers(headers, state, age),
+        headers=response_headers,
     )
 
 

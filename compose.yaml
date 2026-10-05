@@ -17,6 +17,9 @@ services:
       COOKIE_SECURE: "${COOKIE_SECURE:-0}"
       # Persistent upstream/bundle cache TTL. Default: 30 minutes.
       CACHE_TTL_SECONDS: "${CACHE_TTL_SECONDS:-1800}"
+      # Repeated public requests can be treated as a client-side refresh action.
+      BURST_REFRESH_REQUESTS: "${BURST_REFRESH_REQUESTS:-3}"
+      BURST_REFRESH_WINDOW_SECONDS: "${BURST_REFRESH_WINDOW_SECONDS:-60}"
     volumes:
       - submux-data:/data
     security_opt:

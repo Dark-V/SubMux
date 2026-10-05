@@ -2,6 +2,7 @@ const $ = s => document.querySelector(s);
 let subscriptions = [];
 let tokens = [];
 let appConfig = {};
+const refreshStates = new Map();
 
 function flash(message, type='success') {
   const el = $('#flash'); el.textContent = message; el.className = `alert ${type}`;
@@ -19,6 +20,20 @@ async function api(url, options={}) {
 
 function escapeHtml(v='') { return String(v).replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
 function shortToken(v){ return v.length > 18 ? `${v.slice(0,10)}…${v.slice(-6)}` : v; }
+function formatDuration(totalSeconds){
+  const s=Math.max(0,Math.floor(Number(totalSeconds)||0));
+  if(s<60)return `${s} сек.`;
+  const m=Math.floor(s/60), sec=s%60;
+  if(m<60)return sec ? `${m} мин. ${sec} сек.` : `${m} мин.`;
+  const h=Math.floor(m/60), min=m%60;
+  return min ? `${h} ч. ${min} мин.` : `${h} ч.`;
+}
+function humanBytes(bytes){
+  const n=Number(bytes)||0;
+  if(n<1024)return `${n} B`;
+  if(n<1024*1024)return `${(n/1024).toFixed(1)} KiB`;
+  return `${(n/1024/1024).toFixed(1)} MiB`;
+}
 
 async function loadAll(){
   [subscriptions, tokens, appConfig] = await Promise.all([
@@ -29,6 +44,10 @@ async function loadAll(){
   const adminPort = location.port || (location.protocol === 'https:' ? '443' : '80');
   const status = $('#listenerStatus');
   if (status) status.innerHTML = '<span class="dot"></span> ADMIN :' + adminPort + ' · PUBLIC :' + appConfig.public_port;
+  const ttlInput=$('#cacheTtlMinutes');
+  if(ttlInput && document.activeElement!==ttlInput) ttlInput.value=Math.max(1,Math.round((appConfig.cache_ttl_seconds||1800)/60));
+  const burstHint=$('#burstRefreshHint');
+  if(burstHint) burstHint.textContent=`${appConfig.burst_refresh_requests||3} быстрых запроса от одного клиента за ${appConfig.burst_refresh_window_seconds||60} сек. автоматически принудительно обновят кэш.`;
   renderSubs(); renderScopes(); renderTokens(); syncScopeVisibility();
 }
 
@@ -42,15 +61,19 @@ function renderSubs(){
       ? ` <span class="badge warn">служебных: ${s.service_count}</span>`
       : '';
     const stale = s.cache_stale ? ' <span class="badge warn">cache stale</span>' : '';
+    const refresh=refreshStates.get(s.id);
+    const refreshStatus=refresh ? `<div class="item-meta refresh-status ${refresh.phase==='error'?'error':''}" id="refresh-status-${s.id}">${escapeHtml(refresh.message||'')}</div>` : '';
+    const countdown = s.cache_expires_in == null ? '' : ` · автообновление через <span class="cache-countdown" data-expires-at="${Date.now()+s.cache_expires_in*1000}">${escapeHtml(formatDuration(s.cache_expires_in))}</span>`;
     return `
     <div class="item">
       <div>
         <div class="item-title">${escapeHtml(s.name)} <span class="badge ${s.enabled?'ok':''}">${s.enabled?'active':'disabled'}</span><span class="badge">${escapeHtml(s.format)}</span>${service}${stale}</div>
         <div class="item-meta">${escapeHtml(s.url)}</div>
-        <div class="item-meta"><strong>${escapeHtml(nodes)}</strong>${s.cache_age == null ? '' : ` · кэш ${s.cache_age} сек.`}</div>
+        <div class="item-meta"><strong>${escapeHtml(nodes)}</strong>${s.cache_age == null ? '' : ` · кэш ${escapeHtml(formatDuration(s.cache_age))}${countdown}`}</div>
+        ${refreshStatus}
       </div>
       <div class="item-actions">
-        <button class="ghost" onclick="refreshSub(${s.id})">Обновить</button>
+        <button class="ghost" data-refresh-id="${s.id}" onclick="refreshSub(${s.id})" ${refresh?.phase==='running'?'disabled':''}>${refresh?.phase==='running'?'Обновление…':'Обновить'}</button>
         <button class="ghost" onclick="window.open('/api/subscriptions/${s.id}/raw','_blank','noopener')">RAW</button>
         <button class="ghost" onclick="editSub(${s.id})">Изменить</button>
         <button class="danger" onclick="deleteSub(${s.id})">Удалить</button>
@@ -118,17 +141,44 @@ window.editSub=id=>{
 };
 window.deleteSub=async id=>{if(!confirm('Удалить подписку?'))return;try{await api(`/api/subscriptions/${id}`,{method:'DELETE'});await loadAll();flash('Подписка удалена.')}catch(e){flash(e.message,'error')}};
 window.refreshSub=async id=>{
+  const started=performance.now();
+  refreshStates.set(id,{phase:'running',message:'Запрос к upstream…'});
+  renderSubs();
+  const timer=setInterval(()=>{
+    const elapsed=((performance.now()-started)/1000).toFixed(1);
+    const button=document.querySelector(`[data-refresh-id="${id}"]`);
+    const status=document.querySelector(`#refresh-status-${id}`);
+    if(button)button.textContent=`Обновление… ${elapsed}с`;
+    if(status)status.textContent=`Запрос к upstream / пересборка кэша… ${elapsed}с`;
+  },200);
   try{
-    flash('Обновляю источник и связанные сборки...');
     const r=await api(`/api/subscriptions/${id}/refresh`,{method:'POST'});
+    const service=r.service_count? ` · служебных отброшено: ${r.service_count}` : '';
+    const stale=r.stale? ' · использован старый кэш' : '';
+    const elapsed=((r.elapsed_ms||Math.round(performance.now()-started))/1000).toFixed(2);
+    refreshStates.set(id,{
+      phase:r.stale?'error':'done',
+      message:`HTTP ${r.status} · ${r.proxy_count ?? '?'} узлов · ${humanBytes(r.bytes)} · ${elapsed}с · кэш обновлён${service}${stale}`
+    });
     await loadAll();
-    const service=r.service_count? `, служебных отброшено: ${r.service_count}` : '';
-    const stale=r.stale? ' (использован старый кэш)' : '';
-    flash(`Обновлено: ${r.proxy_count ?? '?'} узлов${service}; сборок: ${r.rebuilt_bundles}${stale}`,r.stale?'error':'success');
-  }catch(e){flash(e.message,'error')}
+    flash(`Источник обновлён за ${elapsed}с`,r.stale?'error':'success');
+    setTimeout(()=>{refreshStates.delete(id);renderSubs();},7000);
+  }catch(e){
+    refreshStates.set(id,{phase:'error',message:`Ошибка обновления: ${e.message}`});
+    renderSubs();
+    flash(e.message,'error');
+    setTimeout(()=>{refreshStates.delete(id);renderSubs();},10000);
+  }finally{
+    clearInterval(timer);
+  }
 };
 
 $('#refreshAllBtn')?.addEventListener('click',async()=>{
+  const btn=$('#refreshAllBtn');
+  const original=btn?.textContent||'Обновить всё';
+  const started=performance.now();
+  const timer=setInterval(()=>{if(btn)btn.textContent=`Обновление… ${((performance.now()-started)/1000).toFixed(1)}с`;},200);
+  if(btn)btn.disabled=true;
   try{
     flash('Обновляю все источники...');
     const r=await api('/api/subscriptions/refresh-all',{method:'POST'});
@@ -137,7 +187,29 @@ $('#refreshAllBtn')?.addEventListener('click',async()=>{
     const service=r.service_count ? `; служебных отброшено: ${r.service_count}` : '';
     flash(`Обновлено источников: ${r.refreshed}/${r.sources}; узлов: ${r.proxy_count}${service}; сборок: ${r.rebuilt_bundles}${failed}`,r.failed?.length?'error':'success');
   }catch(e){flash(e.message,'error')}
+  finally{
+    clearInterval(timer);
+    if(btn){btn.disabled=false;btn.textContent=original;}
+  }
 });
+
+$('#cacheTtlForm')?.addEventListener('submit',async e=>{
+  e.preventDefault();
+  const minutes=Math.max(1,Number($('#cacheTtlMinutes').value)||30);
+  try{
+    const r=await api('/api/config',{method:'PATCH',body:JSON.stringify({cache_ttl_seconds:Math.round(minutes*60)})});
+    appConfig.cache_ttl_seconds=r.cache_ttl_seconds;
+    await loadAll();
+    flash(`TTL кэша: ${formatDuration(r.cache_ttl_seconds)}`);
+  }catch(err){flash(err.message,'error')}
+});
+
+setInterval(()=>{
+  document.querySelectorAll('.cache-countdown').forEach(el=>{
+    const left=Math.max(0,Math.ceil((Number(el.dataset.expiresAt)-Date.now())/1000));
+    el.textContent=left>0?formatDuration(left):'сейчас';
+  });
+},1000);
 
 function syncScopeVisibility(){
   $('#scopeBox').classList.toggle('hidden',$('#scopeAll').checked);

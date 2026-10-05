@@ -88,3 +88,12 @@
 
 .copyable{cursor:pointer}
 .copyable:hover{color:var(--accent)}
+
+.cache-settings{display:flex;align-items:end;gap:8px;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}
+.cache-settings label{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--muted);font-weight:600;max-width:190px}
+.cache-settings input{padding:8px 10px}
+.cache-hint{font-size:11px;margin-top:8px}
+.refresh-status{color:var(--accent);font-weight:600}
+.refresh-status.error{color:var(--danger)}
+button:disabled{opacity:.55;cursor:wait}
+.cache-countdown{font-variant-numeric:tabular-nums}

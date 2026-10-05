@@ -12,8 +12,10 @@ SubMux can combine several upstream subscriptions into one token-protected URL, 
 - VLESS / VMess / Trojan / SS URI-list merge;
 - semantic deduplication of the same endpoint;
 - filters service placeholder nodes with all-zero credentials;
-- persistent 30-minute cache by default;
-- manual refresh from the web panel or `?forceUpdate=1`;
+- persistent cache with a live-configurable TTL (30 minutes by default);
+- manual refresh from the web panel with visible request timing/status;
+- forced public refresh aliases: `?force=1`, `?update=1`, `?forceUpdate=1`, `?refresh=1`, `?reload=1`;
+- compatibility burst refresh: 3 requests from the same token + client IP within 60 seconds force an upstream refresh;
 - stale-cache fallback when an upstream is temporarily unavailable;
 - separate admin and public ports.
 
@@ -50,7 +52,12 @@ services:
       COOKIE_SECURE: "0"
 
       # Cache TTL in seconds. 1800 = 30 minutes.
+      # Can be changed later in the admin panel.
       CACHE_TTL_SECONDS: "1800"
+
+      # Repeated-client compatibility refresh.
+      BURST_REFRESH_REQUESTS: "3"
+      BURST_REFRESH_WINDOW_SECONDS: "60"
 
     volumes:
       - submux-data:/data
@@ -99,11 +106,22 @@ For a reverse proxy, point it only to `HOST:8081`. The public listener does not 
 /sub/NAME?token=TOKEN
 ```
 
-Force an immediate refresh:
+Force an immediate refresh (aliases are equivalent):
 
 ```text
+/TOKEN/?force=1
+/TOKEN/?update=1
 /TOKEN/?forceUpdate=1
+/TOKEN/?refresh=1
+/TOKEN/?reload=1
 ```
+
+Responses expose cache state through `X-SubMux-Cache`, `X-SubMux-Cache-Age`,
+`X-SubMux-Cache-TTL`, `X-SubMux-Cache-Expires-In`, and
+`X-SubMux-Refresh-Reason`.
+
+If the same token and client IP requests a subscription 3 times within 60 seconds,
+SubMux treats the third request as an explicit refresh. The counter then resets.
 
 Normal requests use the persistent cache in `/data/submux.db`.
 

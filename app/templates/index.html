@@ -56,6 +56,14 @@
       <div class="endpoint"><code>/TOKEN/sub/superpupervpn</code><span>одна подписка</span></div>
       <div class="endpoint"><code>/subs?token=TOKEN</code><span>query-вариант</span></div>
       <div class="endpoint"><code>Authorization: Bearer TOKEN</code><span>без токена в URL</span></div>
+      <div class="endpoint"><code>?force=1 · ?update=1 · ?forceUpdate=1 · ?refresh=1</code><span>принудительно обновить upstream и кэш</span></div>
+      <form id="cacheTtlForm" class="cache-settings">
+        <label>TTL кэша, минут
+          <input id="cacheTtlMinutes" type="number" min="1" max="10080" step="1" value="30" required>
+        </label>
+        <button class="ghost" type="submit">Сохранить</button>
+      </form>
+      <p class="muted cache-hint" id="burstRefreshHint"></p>
     </div>
   </section>
 
