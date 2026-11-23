@@ -34,6 +34,9 @@
         <label class="span-2">URL<input id="subUrl" type="url" placeholder="https://example.com/subscription" required></label>
         <label>User-Agent<input id="subUa" value="v2raytun/android" required></label>
         <label>HWID<input id="subHwid" placeholder="device-hwid"></label>
+        <label>Формат<select id="subFormat" aria-describedby="subFormatHint"><option value="auto">Auto URI-list</option><option value="base64">Base64 URI-list</option><option value="raw">Raw URI-list</option><option value="throne">Throne (Xray JSON)</option></select></label>
+        <label class="check"><input id="subEnabled" type="checkbox" checked> Включена</label>
+        <p class="muted span-2" id="subFormatHint">Для полных профилей Happ/INCY выбери Throne: балансировка сохранится. Укажи User-Agent <code>Happ/3.6.0/Android</code> и HWID своей подписки.</p>
         <details class="span-2 advanced">
           <summary>Дополнительные заголовки</summary>
           <div class="form-grid inner">
@@ -41,8 +44,6 @@
             <label>OS version<input id="subVerOs" placeholder="Android 15"></label>
             <label>Device model<input id="subModel" placeholder="Xiaomi ..."></label>
             <label>App version<input id="subAppVersion" placeholder="5.23.74"></label>
-            <label>Формат<select id="subFormat"><option value="auto">Auto URI-list</option><option value="base64">Base64 URI-list</option><option value="raw">Raw URI-list</option></select></label>
-            <label class="check"><input id="subEnabled" type="checkbox" checked> Включена</label>
           </div>
         </details>
         <div class="actions span-2"><button class="primary" type="submit" id="subSave">Сохранить</button><button class="ghost hidden" type="button" id="subCancel">Отмена</button></div>

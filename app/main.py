@@ -24,6 +24,8 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
+from app.throne import convert_xray_subscription
+
 APP_NAME = "SubMux"
 APP_VERSION = os.getenv("SUBMUX_VERSION", "0.1.0").strip() or "0.1.0"
 ADMIN_PORT = int(os.getenv("ADMIN_PORT", os.getenv("PORT", "8080")))
@@ -242,8 +244,8 @@ class SubscriptionIn(BaseModel):
     @field_validator("format")
     @classmethod
     def validate_format(cls, value: str) -> str:
-        if value not in {"auto", "base64", "raw"}:
-            raise ValueError("format must be auto, base64 or raw")
+        if value not in {"auto", "base64", "raw", "throne"}:
+            raise ValueError("format must be auto, base64, raw or throne")
         return value
 
 
@@ -474,6 +476,11 @@ async def get_or_refresh_source(
 
         previous = get_cached_source(sub, allow_stale=True)
         result = await fetch_one(client, sub)
+        if result["ok"] and sub["format"] == "throne":
+            try:
+                convert_xray_subscription(result["body"])
+            except ValueError as exc:
+                result.update(ok=False, status=502, error=str(exc))
         if result["ok"]:
             result["cached"] = False
             result["stale"] = False
@@ -722,8 +729,13 @@ def is_service_placeholder_uri(uri: str) -> bool:
 
 
 def analyze_subscription_payload(body: bytes, forced_format: str) -> dict[str, Any]:
+    filtered_service = 0
     try:
-        content, was_base64 = maybe_decode_base64(body, forced_format)
+        if forced_format == "throne":
+            content, filtered_service = convert_xray_subscription(body)
+            was_base64 = False
+        else:
+            content, was_base64 = maybe_decode_base64(body, forced_format)
     except Exception:
         return {
             "proxy_count": None,
@@ -741,7 +753,7 @@ def analyze_subscription_payload(body: bytes, forced_format: str) -> dict[str, A
         }
 
     proxy_count = 0
-    service_count = 0
+    service_count = filtered_service
     for raw in content.replace("\r\n", "\n").split("\n"):
         line = raw.strip()
         if not line:
@@ -795,7 +807,12 @@ def merge_payloads(results: list[dict[str, Any]]) -> tuple[bytes, dict[str, str]
     filtered_service = 0
 
     for result in results:
-        content, was_base64 = maybe_decode_base64(result["body"], result["sub"]["format"])
+        if result["sub"]["format"] == "throne":
+            content, filtered = convert_xray_subscription(result["body"])
+            filtered_service += filtered
+            was_base64 = False
+        else:
+            content, was_base64 = maybe_decode_base64(result["body"], result["sub"]["format"])
         all_base64 = all_base64 and was_base64
 
         # SubMux can safely merge URI-list subscriptions. Arbitrary YAML/JSON
@@ -1522,7 +1539,7 @@ async def serve_public(request: Request, name: str | None = None, path_token: st
     force = query_force or burst_force
     refresh_reason = "query" if query_force else ("burst" if burst_force else "")
 
-    # Named pass-through endpoints use the persistent per-source cache too.
+    # Keep raw upstream bytes in the source cache; adapt only at delivery.
     if name is not None:
         async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
             before = None if force else get_cached_source(subs[0])
@@ -1536,6 +1553,17 @@ async def serve_public(request: Request, name: str | None = None, path_token: st
             )
 
         headers = response_headers_from_upstream(result["headers"])
+        body = result["body"]
+        if result["ok"] and subs[0]["format"] == "throne":
+            try:
+                text, filtered = convert_xray_subscription(body)
+            except ValueError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from None
+            body = text.encode("utf-8")
+            headers["Content-Type"] = "text/plain; charset=utf-8"
+            headers["Content-Disposition"] = "attachment; filename=submux-throne.txt"
+            headers["X-SubMux-Nodes"] = str(len(text.splitlines()))
+            headers["X-SubMux-Filtered-Service"] = str(filtered)
         state = "REFRESH" if force or before is None else "HIT"
         age = int(result.get("cache_age", 0))
         if result.get("stale"):
@@ -1547,7 +1575,7 @@ async def serve_public(request: Request, name: str | None = None, path_token: st
         elif state == "REFRESH":
             response_headers["X-SubMux-Refresh-Reason"] = "ttl-or-miss"
         return Response(
-            content=result["body"],
+            content=body,
             status_code=result["status"],
             headers=response_headers,
         )
