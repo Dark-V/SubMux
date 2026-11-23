@@ -10,6 +10,7 @@ SubMux can combine several upstream subscriptions into one token-protected URL, 
 - per-source `User-Agent`, HWID and device headers;
 - token bundles with selected sources;
 - VLESS / VMess / Trojan / SS URI-list merge;
+- full Xray JSON subscription adapter for Throne, preserving routing and balancers;
 - semantic deduplication of the same endpoint;
 - filters service placeholder nodes with all-zero credentials;
 - persistent cache with a live-configurable TTL (30 minutes by default);
@@ -139,9 +140,29 @@ Service entries that use an all-zero credential, for example:
 
 are filtered from aggregate subscriptions.
 
-Named URLs such as `/TOKEN/sub/NAME` remain pass-through and return the original upstream subscription.
+Named URLs such as `/TOKEN/sub/NAME` return the original upstream subscription for `auto`, `base64` and `raw` sources. Sources set to `throne` return converted Throne profiles on both named and aggregate URLs.
 
-YAML/JSON configs are not merged; use the named pass-through URL for them.
+Other YAML/JSON configs are not merged; use a named pass-through URL for them.
+
+## Throne adapter
+
+Some providers return full Xray configurations to Happ or INCY and a different list of links to other clients. SubMux can fetch the full configurations and expose them as a subscription for the latest Throne release.
+
+In the source settings:
+
+1. Enter the provider's subscription URL.
+2. Set `User-Agent` to `Happ/3.6.0/Android`, or the value your provider requires for full Xray JSON.
+3. Keep the HWID already registered for that subscription.
+4. Select **Throne (Xray JSON)** and save, then refresh the source.
+5. Add the existing SubMux bundle URL or `/TOKEN/sub/NAME` URL to Throne.
+
+The API value for this source format is `"throne"`. It accepts one full Xray JSON object or an array of configurations, as plain text or base64. SubMux wraps each configuration as a full Xray profile for Throne. It preserves outbounds, proxy chains, routing, DNS and balancers; Throne creates the local inbound. Service placeholder configurations with all-zero credentials are filtered out.
+
+Profiles with routing rules that distinguish the original listeners are rejected because Throne replaces those listeners with one bridge.
+
+Converted profiles can share a bundle with ordinary URI-list sources. Each full configuration stays together, so a country's fallback servers and automatic selection remain part of one profile. Provider routing also stays active: its `direct` rules send matching traffic outside the proxy.
+
+The admin panel's **RAW** button returns the original upstream response byte-for-byte, including for Throne sources.
 
 ## Image
 
@@ -150,6 +171,21 @@ ghcr.io/dark-v/submux:latest
 ```
 
 Architectures: `linux/amd64`, `linux/arm64`.
+
+### Development image
+
+Pushes to `dev` publish `ghcr.io/dark-v/submux:dev` and `dev-<full-commit-sha>` after the unit tests and container smoke test pass. The image reports `dev-<short-sha>` in `/healthz` and its startup log. In the Docker workflow, `latest` is reserved for `main`; pull requests run checks without publishing an image.
+
+For a development deployment, use [compose.dev.yaml](compose.dev.yaml). To switch an existing Portainer stack, keep its ports, environment and volume mappings and change the image:
+
+```yaml
+image: ghcr.io/dark-v/submux:dev
+pull_policy: always
+```
+
+In Portainer, open **Stacks → your SubMux stack → Editor**, update the image and choose **Update the stack**, enabling **Re-pull image and redeploy**. Reuse the existing stack and `/data` volume to retain subscriptions, access tokens and cache. For a Git-managed stack, select the `dev` branch and `compose.dev.yaml`, then pull and redeploy.
+
+Each later push to `dev` updates the image tag in the registry. Redeploy the stack with image re-pull to run that build; a running container does not update itself.
 
 ## License
 
