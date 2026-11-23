@@ -172,6 +172,21 @@ ghcr.io/dark-v/submux:latest
 
 Architectures: `linux/amd64`, `linux/arm64`.
 
+### Development image
+
+Pushes to `dev` publish `ghcr.io/dark-v/submux:dev` and `dev-<full-commit-sha>` after the unit tests and container smoke test pass. The image reports `dev-<short-sha>` in `/healthz` and its startup log. In the Docker workflow, `latest` is reserved for `main`; pull requests run checks without publishing an image.
+
+For a development deployment, use [compose.dev.yaml](compose.dev.yaml). To switch an existing Portainer stack, keep its ports, environment and volume mappings and change the image:
+
+```yaml
+image: ghcr.io/dark-v/submux:dev
+pull_policy: always
+```
+
+In Portainer, open **Stacks → your SubMux stack → Editor**, update the image and choose **Update the stack**, enabling **Re-pull image and redeploy**. Reuse the existing stack and `/data` volume to retain subscriptions, access tokens and cache. For a Git-managed stack, select the `dev` branch and `compose.dev.yaml`, then pull and redeploy.
+
+Each later push to `dev` updates the image tag in the registry. Redeploy the stack with image re-pull to run that build; a running container does not update itself.
+
 ## License
 
 MIT

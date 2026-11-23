@@ -1,0 +1,29 @@
+services:
+  submux:
+    image: ghcr.io/dark-v/submux:dev
+    pull_policy: always
+    container_name: submux
+    restart: unless-stopped
+    init: true
+    ports:
+      - "81:8080"
+      - "8081:8081"
+    environment:
+      ADMIN_PORT: "8080"
+      PUBLIC_PORT: "8081"
+      PUBLIC_BASE_URL: ""
+      # Empty => SubMux generates a persistent token in /data/admin_token
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-}"
+      COOKIE_SECURE: "${COOKIE_SECURE:-0}"
+      # Persistent upstream/bundle cache TTL. Default: 30 minutes.
+      CACHE_TTL_SECONDS: "${CACHE_TTL_SECONDS:-1800}"
+      # Repeated public requests can be treated as a client-side refresh action.
+      BURST_REFRESH_REQUESTS: "${BURST_REFRESH_REQUESTS:-3}"
+      BURST_REFRESH_WINDOW_SECONDS: "${BURST_REFRESH_WINDOW_SECONDS:-60}"
+    volumes:
+      - submux-data:/data
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  submux-data:
